@@ -6,12 +6,14 @@ const supabase = createClient(
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFya2ljaHp1ZWduZ3N4bnZ3aGd4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg0OTU4NjAsImV4cCI6MjA5NDA3MTg2MH0.5V61Looj6JHVtMEaFArUIBNOnmXCblF-Xc8o32i_NIc"
 );
 
-// ─── Scheduling constants ──────────────────────────────────
 const WEEKDAY_SLOTS = 2;
 const WEEKEND_SLOTS = 3;
 const MAX_CONSEC = 2;
+const ROLES = ["doctor", "radiologist", "nurse", "other"];
+const ROLE_LABELS = { doctor: "醫師", radiologist: "放射師", nurse: "護理師", other: "其他" };
+const ROLE_COLORS = { doctor: "#dc2626", radiologist: "#0891b2", nurse: "#7c3aed", other: "#64748b" };
+const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706","#db2777","#0284c7","#9333ea"];
 
-// ─── Date helpers ──────────────────────────────────────────
 function getDaysInMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
 function getDow(y, m, d) { return new Date(y, m, d).getDay(); }
 function isWeekend(dow) { return dow === 0 || dow === 6; }
@@ -28,17 +30,22 @@ function getStreak(sched, day, memberId, year, month) {
   return s;
 }
 
-// ─── Auto-generate schedule ────────────────────────────────
-// Rules:
-//   Sat/Sun  → 3 people (any role)
-//   Fri      → 1 放射師 + 1 護理師 + 1 anyone (role-based guarantee)
-//   Mon-Thu  → 2 people, max consecutive days = MAX_CONSEC
-function autoGenerate(year, month, members, leave) {
+function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays) {
   const days = getDaysInMonth(year, month);
   const sched = {};
   const cnt = Object.fromEntries(members.map(mbr => [mbr.id, 0]));
 
   for (let d = 1; d <= days; d++) {
+    if (lockedDays && lockedDays.has(d)) {
+      sched[d] = existingSched[d] || [];
+      sched[d].forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+      continue;
+    }
+    if (holidayDays && holidayDays.has(d)) {
+      sched[d] = existingSched[d] || [];
+      continue;
+    }
+
     const dow = getDow(year, month, d);
     const lv = leave[d] || [];
     const avail = members.filter(mbr => !lv.includes(mbr.id));
@@ -49,17 +56,11 @@ function autoGenerate(year, month, members, leave) {
     } else if (isFriday(dow)) {
       const result = [];
       const used = new Set();
-      const rads = avail
-        .filter(mbr => mbr.role === "radiologist")
-        .sort((a, b) => cnt[a.id] - cnt[b.id]);
-      const nurses = avail
-        .filter(mbr => mbr.role === "nurse")
-        .sort((a, b) => cnt[a.id] - cnt[b.id]);
+      const rads = avail.filter(mbr => mbr.role === "radiologist").sort((a, b) => cnt[a.id] - cnt[b.id]);
+      const nurses = avail.filter(mbr => mbr.role === "nurse").sort((a, b) => cnt[a.id] - cnt[b.id]);
       if (rads.length > 0) { result.push(rads[0].id); used.add(rads[0].id); }
       if (nurses.length > 0) { result.push(nurses[0].id); used.add(nurses[0].id); }
-      const extra = avail
-        .filter(mbr => !used.has(mbr.id))
-        .sort((a, b) => cnt[a.id] - cnt[b.id]);
+      const extra = avail.filter(mbr => !used.has(mbr.id)).sort((a, b) => cnt[a.id] - cnt[b.id]);
       if (extra.length > 0) result.push(extra[0].id);
       sched[d] = result;
     } else {
@@ -73,7 +74,6 @@ function autoGenerate(year, month, members, leave) {
   return sched;
 }
 
-// ─── Supabase data layer ───────────────────────────────────
 async function dbFetchMembers() {
   const { data, error } = await supabase.from("members").select("*").order("sort_order");
   if (error) throw error;
@@ -82,15 +82,17 @@ async function dbFetchMembers() {
 
 async function dbFetchSchedule(year, month) {
   const { data, error } = await supabase
-    .from("schedules").select("day, member_id")
+    .from("schedules").select("day, member_id, manually_set")
     .eq("year", year).eq("month", month);
   if (error) throw error;
-  const result = {};
+  const schedule = {};
+  const lockedDays = new Set();
   for (const row of data) {
-    if (!result[row.day]) result[row.day] = [];
-    result[row.day].push(row.member_id);
+    if (!schedule[row.day]) schedule[row.day] = [];
+    schedule[row.day].push(row.member_id);
+    if (row.manually_set) lockedDays.add(row.day);
   }
-  return result;
+  return { schedule, lockedDays };
 }
 
 async function dbFetchLeave(year, month) {
@@ -106,13 +108,52 @@ async function dbFetchLeave(year, month) {
   return result;
 }
 
-// ─── UI constants ──────────────────────────────────────────
-const DOW_LABELS = ["日", "一", "二", "三", "四", "五", "六"];
-const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
-const ROLE_LABELS = { radiologist: "放射師", nurse: "護理師", other: "其他" };
-const ROLE_COLORS = { radiologist: "#0891b2", nurse: "#7c3aed", other: "#64748b" };
+async function dbFetchHolidays(year) {
+  const { data, error } = await supabase
+    .from("holidays").select("*")
+    .eq("year", year).order("month").order("day");
+  if (error) throw error;
+  return data;
+}
 
-// ═══════════════════════════════════════════════════════════
+const DOW_LABELS = ["日","一","二","三","四","五","六"];
+const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
+
+function MemberForm({ member, onChange, onSave, onCancel, saving }) {
+  return (
+    <div style={S.formBox}>
+      <div style={S.formRow}>
+        <label style={S.formLabel}>姓名</label>
+        <input style={S.formInput} value={member.name} onChange={e => onChange({ ...member, name: e.target.value })} />
+      </div>
+      <div style={S.formRow}>
+        <label style={S.formLabel}>職類</label>
+        <select style={S.formSelect} value={member.role} onChange={e => onChange({ ...member, role: e.target.value })}>
+          {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
+        </select>
+      </div>
+      <div style={S.formRow}>
+        <label style={S.formLabel}>電話</label>
+        <input style={S.formInput} value={member.phone || ""} onChange={e => onChange({ ...member, phone: e.target.value })} placeholder="選填" />
+      </div>
+      <div style={S.formRow}>
+        <label style={S.formLabel}>顏色</label>
+        <input type="color" value={member.color} onChange={e => onChange({ ...member, color: e.target.value })} style={{ width: 40, height: 32, border: "none", cursor: "pointer" }} />
+      </div>
+      <div style={S.formRow}>
+        <label style={S.formLabel}>管理員</label>
+        <input type="checkbox" checked={!!member.is_admin} onChange={e => onChange({ ...member, is_admin: e.target.checked })} style={{ width: 18, height: 18, cursor: "pointer" }} />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button style={S.btnPrimary} onClick={onSave} disabled={saving || !member.name.trim()}>
+          {saving ? "儲存中…" : "✓ 儲存"}
+        </button>
+        <button style={S.btnSecondary} onClick={onCancel}>取消</button>
+      </div>
+    </div>
+  );
+}
+
 export default function CathScheduler() {
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
@@ -120,7 +161,10 @@ export default function CathScheduler() {
   const [members, setMembers] = useState([]);
   const [schedule, setSchedule] = useState({});
   const [leaveMap, setLeaveMap] = useState({});
+  const [lockedDays, setLockedDays] = useState(new Set());
+  const [holidays, setHolidays] = useState([]);
   const [view, setView] = useState("calendar");
+  const [adminTab, setAdminTab] = useState("members");
   const [selectedDay, setSelectedDay] = useState(null);
   const [editMode, setEditMode] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -128,6 +172,13 @@ export default function CathScheduler() {
   const [toast, setToast] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [showUserPicker, setShowUserPicker] = useState(false);
+  const [editingMember, setEditingMember] = useState(null);
+  const [newMember, setNewMember] = useState(null);
+  const [memberSaving, setMemberSaving] = useState(false);
+  const [newHoliday, setNewHoliday] = useState({ month: today.getMonth() + 1, day: "", name: "" });
+  const [holidaySaving, setHolidaySaving] = useState(false);
+
+  const isAdmin = currentUser?.is_admin ?? false;
 
   const notify = (msg, type = "ok") => {
     setToast({ msg, type });
@@ -137,14 +188,17 @@ export default function CathScheduler() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [mData, sData, lData] = await Promise.all([
+      const [mData, { schedule: sData, lockedDays: ld }, lData, hData] = await Promise.all([
         dbFetchMembers(),
         dbFetchSchedule(year, month),
         dbFetchLeave(year, month),
+        dbFetchHolidays(year),
       ]);
       setMembers(mData);
       setSchedule(sData);
+      setLockedDays(ld);
       setLeaveMap(lData);
+      setHolidays(hData);
     } catch (e) {
       notify("⚠️ 載入失敗：" + e.message, "err");
     }
@@ -153,22 +207,25 @@ export default function CathScheduler() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
-  // ── Save entire month schedule (used after auto-generate) ──
   async function saveFullSchedule(newSched) {
     setSaving(true);
     try {
-      await supabase.from("schedules").delete().eq("year", year).eq("month", month);
+      await supabase.from("schedules").delete()
+        .eq("year", year).eq("month", month).eq("manually_set", false);
       const rows = [];
       for (const [day, ids] of Object.entries(newSched)) {
+        if (lockedDays.has(parseInt(day))) continue;
         for (const member_id of ids) {
-          rows.push({ year, month, day: parseInt(day), member_id });
+          rows.push({ year, month, day: parseInt(day), member_id, manually_set: false });
         }
       }
       if (rows.length > 0) {
         const { error } = await supabase.from("schedules").insert(rows);
         if (error) throw error;
       }
-      setSchedule(newSched);
+      const merged = { ...newSched };
+      lockedDays.forEach(d => { merged[d] = schedule[d] || []; });
+      setSchedule(merged);
       notify("✅ 班表已儲存");
     } catch (e) {
       notify("❌ 儲存失敗：" + e.message, "err");
@@ -176,7 +233,6 @@ export default function CathScheduler() {
     setSaving(false);
   }
 
-  // ── Toggle single member on a day (manual edit) ──
   async function toggleAssign(day, memberId) {
     if (saving) return;
     const arr = schedule[day] ? [...schedule[day]] : [];
@@ -187,11 +243,18 @@ export default function CathScheduler() {
         const { error } = await supabase.from("schedules").delete()
           .eq("year", year).eq("month", month).eq("day", day).eq("member_id", memberId);
         if (error) throw error;
-        setSchedule(prev => ({ ...prev, [day]: arr.filter(x => x !== memberId) }));
+        const newArr = arr.filter(x => x !== memberId);
+        setSchedule(prev => ({ ...prev, [day]: newArr }));
+        if (newArr.length === 0) {
+          setLockedDays(prev => { const s = new Set(prev); s.delete(day); return s; });
+        }
       } else {
-        const { error } = await supabase.from("schedules").insert({ year, month, day, member_id: memberId });
+        const { error } = await supabase.from("schedules").insert({ year, month, day, member_id: memberId, manually_set: true });
         if (error) throw error;
+        await supabase.from("schedules").update({ manually_set: true })
+          .eq("year", year).eq("month", month).eq("day", day);
         setSchedule(prev => ({ ...prev, [day]: [...arr, memberId] }));
+        setLockedDays(prev => new Set([...prev, day]));
       }
     } catch (e) {
       notify("❌ 操作失敗：" + e.message, "err");
@@ -199,7 +262,6 @@ export default function CathScheduler() {
     setSaving(false);
   }
 
-  // ── Toggle leave ──
   async function toggleLeave(day, memberId) {
     if (saving) return;
     const arr = leaveMap[day] ? [...leaveMap[day]] : [];
@@ -215,7 +277,6 @@ export default function CathScheduler() {
         const { error } = await supabase.from("leaves").insert({ year, month, day, member_id: memberId });
         if (error) throw error;
         setLeaveMap(prev => ({ ...prev, [day]: [...arr, memberId] }));
-        // Auto-remove from schedule if on leave
         if (schedule[day]?.includes(memberId)) {
           await supabase.from("schedules").delete()
             .eq("year", year).eq("month", month).eq("day", day).eq("member_id", memberId);
@@ -230,8 +291,83 @@ export default function CathScheduler() {
   }
 
   function handleAutoGenerate() {
-    const gen = autoGenerate(year, month, members, leaveMap);
+    const holidayDays = new Set(
+      holidays.filter(h => h.year === year && h.month === month + 1).map(h => h.day)
+    );
+    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays);
     saveFullSchedule(gen);
+  }
+
+  async function saveMember(m) {
+    setMemberSaving(true);
+    try {
+      if (m.id) {
+        const { error } = await supabase.from("members").update({
+          name: m.name, role: m.role, phone: m.phone || "", color: m.color, is_admin: !!m.is_admin,
+        }).eq("id", m.id);
+        if (error) throw error;
+        setMembers(prev => prev.map(x => x.id === m.id ? { ...x, ...m } : x));
+      } else {
+        const newId = Math.random().toString(36).slice(2, 10);
+        const maxOrder = members.reduce((max, x) => Math.max(max, x.sort_order || 0), 0);
+        const { data, error } = await supabase.from("members").insert({
+          id: newId, name: m.name, role: m.role, phone: m.phone || "",
+          color: m.color, is_admin: !!m.is_admin, sort_order: maxOrder + 1,
+        }).select().single();
+        if (error) throw error;
+        setMembers(prev => [...prev, data]);
+      }
+      setEditingMember(null);
+      setNewMember(null);
+      notify("✅ 成員已儲存");
+    } catch (e) {
+      notify("❌ 儲存失敗：" + e.message, "err");
+    }
+    setMemberSaving(false);
+  }
+
+  async function deleteMember(id) {
+    if (!window.confirm("確定刪除此成員？相關排班記錄也會一併移除。")) return;
+    setMemberSaving(true);
+    try {
+      await supabase.from("schedules").delete().eq("member_id", id);
+      await supabase.from("leaves").delete().eq("member_id", id);
+      const { error } = await supabase.from("members").delete().eq("id", id);
+      if (error) throw error;
+      setMembers(prev => prev.filter(x => x.id !== id));
+      notify("🗑️ 成員已刪除");
+    } catch (e) {
+      notify("❌ 刪除失敗：" + e.message, "err");
+    }
+    setMemberSaving(false);
+  }
+
+  async function addHoliday() {
+    if (!newHoliday.day || !newHoliday.name) { notify("請填寫日期和名稱", "err"); return; }
+    setHolidaySaving(true);
+    try {
+      const { data, error } = await supabase.from("holidays").insert({
+        year, month: parseInt(newHoliday.month), day: parseInt(newHoliday.day), name: newHoliday.name,
+      }).select().single();
+      if (error) throw error;
+      setHolidays(prev => [...prev, data].sort((a, b) => a.month - b.month || a.day - b.day));
+      setNewHoliday({ month: today.getMonth() + 1, day: "", name: "" });
+      notify("✅ 假日已新增");
+    } catch (e) {
+      notify("❌ 新增失敗：" + e.message, "err");
+    }
+    setHolidaySaving(false);
+  }
+
+  async function deleteHoliday(id) {
+    try {
+      const { error } = await supabase.from("holidays").delete().eq("id", id);
+      if (error) throw error;
+      setHolidays(prev => prev.filter(h => h.id !== id));
+      notify("🗑️ 假日已刪除");
+    } catch (e) {
+      notify("❌ 刪除失敗：" + e.message, "err");
+    }
   }
 
   function getMember(id) { return members.find(m => m.id === id); }
@@ -246,8 +382,7 @@ export default function CathScheduler() {
   }
 
   const cells = buildCalendar();
-  const isToday = (d) =>
-    d === today.getDate() && month === today.getMonth() && year === today.getFullYear();
+  const isToday = (d) => d === today.getDate() && month === today.getMonth() && year === today.getFullYear();
 
   const callCount = {};
   members.forEach(m => { callCount[m.id] = 0; });
@@ -255,17 +390,19 @@ export default function CathScheduler() {
     ids.forEach(id => { if (callCount[id] !== undefined) callCount[id]++; })
   );
 
-  // ─────────────────────────────────────────────────────────
+  const holidayMap = {};
+  holidays.filter(h => h.year === year && h.month === month + 1).forEach(h => {
+    holidayMap[h.day] = h.name;
+  });
+
   return (
     <div style={S.root}>
-      {/* Toast */}
       {toast && (
         <div style={{ ...S.toast, background: toast.type === "err" ? "#dc2626" : "#0891b2" }}>
           {toast.msg}
         </div>
       )}
 
-      {/* Header */}
       <header style={S.header}>
         <div style={S.headerLeft}>
           <span style={S.logo}>🫀</span>
@@ -278,13 +415,12 @@ export default function CathScheduler() {
           {saving && <span style={S.savingTxt}>⟳ 儲存中...</span>}
           <button style={S.userBtn} onClick={() => setShowUserPicker(true)}>
             {currentUser ? (
-              <><span style={{ ...S.dot, background: currentUser.color }} />{currentUser.name}</>
+              <><span style={{ ...S.dot, background: currentUser.color }} />{currentUser.name}{currentUser.is_admin && <span style={S.adminBadge}>管理員</span>}</>
             ) : "選擇身份"}
           </button>
         </div>
       </header>
 
-      {/* User Picker Modal */}
       {showUserPicker && (
         <div style={S.modalOverlay} onClick={() => setShowUserPicker(false)}>
           <div style={S.modalBox} onClick={e => e.stopPropagation()}>
@@ -306,7 +442,6 @@ export default function CathScheduler() {
         </div>
       )}
 
-      {/* Nav */}
       <nav style={S.nav}>
         {[["calendar","📅 班表"],["leave","🙋 預假"],["stats","📊 統計"]].map(([v, l]) => (
           <button key={v}
@@ -315,24 +450,28 @@ export default function CathScheduler() {
             {l}
           </button>
         ))}
+        {isAdmin && (
+          <button
+            style={{ ...S.navBtn, ...(view === "admin" ? S.navActive : {}) }}
+            onClick={() => { setView("admin"); setSelectedDay(null); setEditMode(false); }}>
+            ⚙️ 管理
+          </button>
+        )}
       </nav>
 
-      {/* Month Navigator */}
       <div style={S.monthNav}>
         <button style={S.arrowBtn} onClick={() => {
-          setSelectedDay(null);
-          setEditMode(false);
+          setSelectedDay(null); setEditMode(false);
           if (month === 0) { setYear(y => y - 1); setMonth(11); }
           else setMonth(m => m - 1);
         }}>‹</button>
         <span style={S.monthLabel}>{year} 年 {MONTH_NAMES[month]}</span>
         <button style={S.arrowBtn} onClick={() => {
-          setSelectedDay(null);
-          setEditMode(false);
+          setSelectedDay(null); setEditMode(false);
           if (month === 11) { setYear(y => y + 1); setMonth(0); }
           else setMonth(m => m + 1);
         }}>›</button>
-        {view === "calendar" && (
+        {view === "calendar" && isAdmin && (
           <>
             <button style={S.genBtn} onClick={handleAutoGenerate} disabled={saving || loading}>
               ⚡ 自動排班
@@ -349,17 +488,15 @@ export default function CathScheduler() {
 
       {loading && <div style={S.loadingBar}><div style={S.loadingFill} /></div>}
 
-      {/* Edit mode banner */}
       {editMode && view === "calendar" && (
         <div style={S.editBanner}>
-          ✏️ 手動調整模式：點擊日期格子中的人員姓名來加入 / 移除
+          ✏️ 手動調整模式：點擊日期格子中的人員姓名來加入 / 移除（已鎖定日期 🔒 不受自動排班影響）
         </div>
       )}
 
       {/* ── Calendar View ── */}
       {view === "calendar" && (
         <div style={S.content}>
-          {/* DOW headers */}
           <div style={S.calGrid}>
             {DOW_LABELS.map((d, i) => (
               <div key={d} style={{ ...S.dowHeader, color: i === 0 ? "#dc2626" : i === 6 ? "#2563eb" : "#64748b" }}>
@@ -367,8 +504,6 @@ export default function CathScheduler() {
               </div>
             ))}
           </div>
-
-          {/* Calendar cells */}
           <div style={S.calGrid}>
             {cells.map((d, i) => {
               if (!d) return <div key={i} style={S.emptyCell} />;
@@ -378,6 +513,8 @@ export default function CathScheduler() {
               const wg = isWeekend(dow);
               const fri = isFriday(dow);
               const isSelected = selectedDay === d;
+              const isLocked = lockedDays.has(d);
+              const holName = holidayMap[d];
 
               return (
                 <div key={d}
@@ -385,19 +522,22 @@ export default function CathScheduler() {
                     ...S.cell,
                     ...(wg ? S.cellWG : {}),
                     ...(fri ? S.cellFri : {}),
+                    ...(holName ? S.cellHoliday : {}),
                     ...(isToday(d) ? S.cellToday : {}),
                     ...(isSelected && !editMode ? S.cellSelected : {}),
                     ...(editMode ? S.cellEditMode : {}),
                   }}
-                  onClick={() => {
-                    if (!editMode) setSelectedDay(isSelected ? null : d);
-                  }}>
-                  <div style={{ ...S.cellDay, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>
-                    {d}
+                  onClick={() => { if (!editMode) setSelectedDay(isSelected ? null : d); }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                    <div style={{ ...S.cellDay, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>
+                      {d}
+                    </div>
+                    {isLocked && <span title="手動排定，自動排班不覆蓋" style={S.lockIcon}>🔒</span>}
                   </div>
                   <div style={S.cellDow}>
                     {DOW_LABELS[dow]}{wg ? " 🌙" : fri ? " ★" : ""}
                   </div>
+                  {holName && <div style={S.holidayLabel}>{holName}</div>}
                   <div style={S.cellMembers}>
                     {assigned.map(id => {
                       const mbr = getMember(id);
@@ -418,8 +558,7 @@ export default function CathScheduler() {
                         </span>
                       );
                     })}
-                    {/* Add button in edit mode */}
-                    {editMode && (
+                    {editMode && isAdmin && (
                       <span style={S.chipAdd}
                         onClick={(e) => { e.stopPropagation(); setSelectedDay(d === selectedDay ? null : d); }}>
                         + 加入
@@ -434,14 +573,15 @@ export default function CathScheduler() {
             })}
           </div>
 
-          {/* Detail / Edit panel */}
-          {selectedDay && !editMode && (
+          {selectedDay && !editMode && isAdmin && (
             <div style={S.panel}>
               <div style={S.panelHeader}>
                 <div style={S.panelTitle}>
                   {month + 1}/{selectedDay}（{DOW_LABELS[getDow(year, month, selectedDay)]}）
                   {isWeekend(getDow(year, month, selectedDay)) && <span style={S.panelBadgeWG}>🌙 週末</span>}
                   {isFriday(getDow(year, month, selectedDay)) && <span style={S.panelBadgeFri}>★ 週五特排</span>}
+                  {lockedDays.has(selectedDay) && <span style={S.panelBadgeLock}>🔒 已鎖定</span>}
+                  {holidayMap[selectedDay] && <span style={S.panelBadgeHol}>🎌 {holidayMap[selectedDay]}</span>}
                 </div>
                 <button style={S.panelClose} onClick={() => setSelectedDay(null)}>✕</button>
               </div>
@@ -472,8 +612,7 @@ export default function CathScheduler() {
             </div>
           )}
 
-          {/* Edit mode add-member panel */}
-          {selectedDay && editMode && (
+          {selectedDay && editMode && isAdmin && (
             <div style={{ ...S.panel, borderColor: "#f59e0b60" }}>
               <div style={S.panelHeader}>
                 <div style={{ ...S.panelTitle, color: "#b45309" }}>
@@ -524,12 +663,12 @@ export default function CathScheduler() {
               if (!d) return <div key={i} style={S.emptyCell} />;
               const dow = getDow(year, month, d);
               const leaves = leaveMap[d] || [];
+              const holName = holidayMap[d];
               return (
-                <div key={d} style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), minHeight: 88 }}>
-                  <div style={{ ...S.cellDay, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>
-                    {d}
-                  </div>
+                <div key={d} style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), minHeight: 88 }}>
+                  <div style={{ ...S.cellDay, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
                   <div style={S.cellDow}>{DOW_LABELS[dow]}</div>
+                  {holName && <div style={S.holidayLabel}>{holName}</div>}
                   <div style={S.cellMembers}>
                     {members.map(mbr => {
                       const onLeave = leaves.includes(mbr.id);
@@ -588,18 +727,139 @@ export default function CathScheduler() {
           </div>
         </div>
       )}
+
+      {/* ── Admin View ── */}
+      {view === "admin" && isAdmin && (
+        <div style={S.content}>
+          <div style={S.adminTabs}>
+            {[["members","👥 人員管理"],["holidays","🎌 國定假日"]].map(([t, l]) => (
+              <button key={t}
+                style={{ ...S.adminTabBtn, ...(adminTab === t ? S.adminTabActive : {}) }}
+                onClick={() => setAdminTab(t)}>
+                {l}
+              </button>
+            ))}
+          </div>
+
+          {adminTab === "members" && (
+            <div style={S.adminSection}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <div style={S.sectionTitle}>成員名單</div>
+                {!newMember && (
+                  <button style={S.btnPrimary} onClick={() => setNewMember({
+                    name: "", role: "nurse", phone: "", color: DEFAULT_COLORS[members.length % DEFAULT_COLORS.length], is_admin: false,
+                  })}>
+                    + 新增成員
+                  </button>
+                )}
+              </div>
+
+              {newMember && (
+                <div style={{ ...S.memberCard, borderColor: "#0891b2" }}>
+                  <div style={{ ...S.sectionTitle, color: "#0891b2", marginBottom: 10 }}>新增成員</div>
+                  <MemberForm
+                    member={newMember}
+                    onChange={setNewMember}
+                    onSave={() => saveMember(newMember)}
+                    onCancel={() => setNewMember(null)}
+                    saving={memberSaving}
+                  />
+                </div>
+              )}
+
+              {members.map(m => (
+                <div key={m.id} style={S.memberCard}>
+                  {editingMember?.id === m.id ? (
+                    <MemberForm
+                      member={editingMember}
+                      onChange={setEditingMember}
+                      onSave={() => saveMember(editingMember)}
+                      onCancel={() => setEditingMember(null)}
+                      saving={memberSaving}
+                    />
+                  ) : (
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                      <span style={{ ...S.dot, background: m.color, width: 14, height: 14, flexShrink: 0 }} />
+                      <span style={{ fontWeight: 700, fontSize: 15, flex: 1, minWidth: 60 }}>{m.name}</span>
+                      <span style={{ ...S.roleTag, background: ROLE_COLORS[m.role] + "18", color: ROLE_COLORS[m.role] }}>
+                        {ROLE_LABELS[m.role]}
+                      </span>
+                      {m.is_admin && <span style={S.adminBadge}>管理員</span>}
+                      {m.phone && <span style={{ fontSize: 13, color: "#64748b" }}>📞 {m.phone}</span>}
+                      <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
+                        <button style={S.btnSmall} onClick={() => setEditingMember({ ...m })}>編輯</button>
+                        <button style={{ ...S.btnSmall, color: "#dc2626", borderColor: "#fca5a5" }}
+                          onClick={() => deleteMember(m.id)}>刪除</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {adminTab === "holidays" && (
+            <div style={S.adminSection}>
+              <div style={S.sectionTitle}>{year} 年國定假日</div>
+              <div style={S.formBox}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+                  <div>
+                    <div style={S.formLabel}>月份</div>
+                    <select style={{ ...S.formSelect, width: 80 }}
+                      value={newHoliday.month}
+                      onChange={e => setNewHoliday(h => ({ ...h, month: e.target.value }))}>
+                      {Array.from({ length: 12 }, (_, i) => (
+                        <option key={i + 1} value={i + 1}>{i + 1} 月</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <div style={S.formLabel}>日期</div>
+                    <input style={{ ...S.formInput, width: 64 }} type="number" min="1" max="31"
+                      placeholder="日"
+                      value={newHoliday.day}
+                      onChange={e => setNewHoliday(h => ({ ...h, day: e.target.value }))} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={S.formLabel}>名稱</div>
+                    <input style={S.formInput} placeholder="假日名稱"
+                      value={newHoliday.name}
+                      onChange={e => setNewHoliday(h => ({ ...h, name: e.target.value }))} />
+                  </div>
+                  <button style={S.btnPrimary} onClick={addHoliday} disabled={holidaySaving}>
+                    {holidaySaving ? "新增中…" : "+ 新增"}
+                  </button>
+                </div>
+              </div>
+
+              {holidays.filter(h => h.year === year).length === 0 && (
+                <div style={{ color: "#94a3b8", fontSize: 14, padding: "12px 0" }}>尚未設定任何假日</div>
+              )}
+              {holidays.filter(h => h.year === year).map(h => (
+                <div key={h.id} style={{ ...S.memberCard, display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 18 }}>🎌</span>
+                  <span style={{ fontWeight: 700, color: "#dc2626", minWidth: 60 }}>
+                    {h.month}/{h.day}
+                  </span>
+                  <span style={{ flex: 1, fontSize: 14 }}>{h.name}</span>
+                  <span style={{ fontSize: 12, color: "#94a3b8" }}>
+                    ({DOW_LABELS[getDow(h.year, h.month - 1, h.day)]})
+                  </span>
+                  <button style={{ ...S.btnSmall, color: "#dc2626", borderColor: "#fca5a5" }}
+                    onClick={() => deleteHoliday(h.id)}>刪除</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Styles — light theme, larger fonts
-// ═══════════════════════════════════════════════════════════
 const S = {
   root: {
-    minHeight: "100vh",
-    background: "#f1f5f9",
-    color: "#0f172a",
+    minHeight: "100vh", background: "#f1f5f9", color: "#0f172a",
     fontFamily: "'Noto Sans TC', 'Microsoft JhengHei', sans-serif",
   },
   toast: {
@@ -622,6 +882,10 @@ const S = {
     display: "flex", alignItems: "center", gap: 6,
     background: "#f0f9ff", border: "1.5px solid #bae6fd", color: "#0369a1",
     padding: "7px 16px", borderRadius: 20, fontSize: 14, cursor: "pointer", fontWeight: 600,
+  },
+  adminBadge: {
+    fontSize: 10, padding: "1px 6px", borderRadius: 6,
+    background: "#fef3c7", color: "#92400e", fontWeight: 700, border: "1px solid #fde68a",
   },
   dot: { borderRadius: "50%", display: "inline-block", flexShrink: 0, width: 10, height: 10 },
   nav: {
@@ -675,16 +939,22 @@ const S = {
     background: "#fff", borderRadius: 8, padding: "7px 6px", minHeight: 80,
     cursor: "pointer", border: "1.5px solid #e2e8f0",
     transition: "border-color 0.15s, box-shadow 0.15s",
-    position: "relative", overflow: "hidden",
-    boxShadow: "0 1px 2px #0001",
+    position: "relative", overflow: "hidden", boxShadow: "0 1px 2px #0001",
   },
   cellWG: { background: "#eff6ff", borderColor: "#bfdbfe" },
   cellFri: { background: "#fffbeb", borderColor: "#fde68a" },
+  cellHoliday: { background: "#fff1f2", borderColor: "#fecdd3" },
   cellToday: { borderColor: "#0891b2", boxShadow: "0 0 0 2px #0891b230" },
   cellSelected: { borderColor: "#0891b2", background: "#e0f2fe" },
   cellEditMode: { cursor: "default", borderColor: "#fcd34d" },
   cellDay: { fontSize: 15, fontWeight: 800, lineHeight: 1.2 },
-  cellDow: { fontSize: 10, color: "#94a3b8", marginBottom: 4 },
+  cellDow: { fontSize: 10, color: "#94a3b8", marginBottom: 2 },
+  lockIcon: { fontSize: 10, lineHeight: 1 },
+  holidayLabel: {
+    fontSize: 10, color: "#dc2626", fontWeight: 700,
+    background: "#ffe4e6", borderRadius: 4, padding: "1px 4px",
+    display: "inline-block", marginBottom: 2,
+  },
   cellMembers: { display: "flex", flexWrap: "wrap", gap: 3 },
   chip: {
     fontSize: 11, padding: "2px 7px", borderRadius: 8, fontWeight: 600,
@@ -703,9 +973,11 @@ const S = {
     borderRadius: 12, padding: "14px 16px", boxShadow: "0 2px 12px #0891b210",
   },
   panelHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
-  panelTitle: { fontWeight: 800, fontSize: 16, color: "#0891b2", display: "flex", alignItems: "center", gap: 8 },
+  panelTitle: { fontWeight: 800, fontSize: 16, color: "#0891b2", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
   panelBadgeWG: { fontSize: 12, background: "#eff6ff", color: "#2563eb", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
   panelBadgeFri: { fontSize: 12, background: "#fffbeb", color: "#b45309", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
+  panelBadgeLock: { fontSize: 12, background: "#fef3c7", color: "#92400e", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
+  panelBadgeHol: { fontSize: 12, background: "#fff1f2", color: "#dc2626", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
   panelClose: {
     width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #e2e8f0",
     background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 14,
@@ -719,9 +991,7 @@ const S = {
     transition: "all 0.15s", display: "flex", alignItems: "center", gap: 5,
   },
   memberOnLeave: { opacity: 0.3, cursor: "not-allowed" },
-  leaveNote: {
-    fontSize: 14, color: "#475569", padding: "10px 4px 6px", fontWeight: 500,
-  },
+  leaveNote: { fontSize: 14, color: "#475569", padding: "10px 4px 6px", fontWeight: 500 },
   statsGrid: { paddingTop: 12, display: "flex", flexDirection: "column", gap: 10 },
   statCard: {
     background: "#fff", borderRadius: 10, padding: "14px 18px",
@@ -733,10 +1003,7 @@ const S = {
   statName: { fontWeight: 700, fontSize: 15, color: "#0f172a" },
   statCount: { fontWeight: 800, fontSize: 18, position: "relative" },
   statsNote: { textAlign: "center", fontSize: 13, color: "#94a3b8", marginTop: 16 },
-  roleTag: {
-    fontSize: 11, padding: "2px 7px", borderRadius: 6, fontWeight: 600,
-    display: "inline-block",
-  },
+  roleTag: { fontSize: 11, padding: "2px 7px", borderRadius: 6, fontWeight: 600, display: "inline-block" },
   modalOverlay: {
     position: "fixed", inset: 0, background: "#00000066", zIndex: 100,
     display: "flex", alignItems: "center", justifyContent: "center",
@@ -754,4 +1021,42 @@ const S = {
     transition: "background 0.15s",
   },
   pickName: { fontWeight: 700, fontSize: 14, flex: 1 },
+  adminTabs: { display: "flex", gap: 4, marginBottom: 16 },
+  adminTabBtn: {
+    padding: "8px 18px", borderRadius: 20, border: "1.5px solid #e2e8f0",
+    background: "#f8fafc", color: "#64748b", cursor: "pointer", fontSize: 14, fontWeight: 600,
+  },
+  adminTabActive: { background: "#e0f2fe", color: "#0891b2", borderColor: "#bae6fd" },
+  adminSection: { background: "#fff", borderRadius: 12, padding: 16, border: "1.5px solid #e2e8f0" },
+  sectionTitle: { fontWeight: 800, fontSize: 16, color: "#1e293b", marginBottom: 12 },
+  memberCard: {
+    background: "#f8fafc", borderRadius: 10, padding: "12px 14px",
+    border: "1.5px solid #e2e8f0", marginBottom: 8,
+  },
+  formBox: {
+    background: "#f1f5f9", borderRadius: 10, padding: 14,
+    border: "1.5px solid #e2e8f0", marginBottom: 12,
+  },
+  formRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 8 },
+  formLabel: { fontSize: 13, fontWeight: 600, color: "#475569", minWidth: 44 },
+  formInput: {
+    flex: 1, padding: "7px 10px", borderRadius: 8, border: "1.5px solid #cbd5e1",
+    fontSize: 14, background: "#fff", color: "#1e293b", outline: "none",
+  },
+  formSelect: {
+    flex: 1, padding: "7px 10px", borderRadius: 8, border: "1.5px solid #cbd5e1",
+    fontSize: 14, background: "#fff", color: "#1e293b", outline: "none",
+  },
+  btnPrimary: {
+    padding: "8px 16px", background: "#0891b2", color: "#fff",
+    border: "none", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 13,
+  },
+  btnSecondary: {
+    padding: "8px 16px", background: "#f1f5f9", color: "#475569",
+    border: "1.5px solid #e2e8f0", borderRadius: 20, fontWeight: 600, cursor: "pointer", fontSize: 13,
+  },
+  btnSmall: {
+    padding: "5px 12px", background: "#f8fafc", color: "#334155",
+    border: "1.5px solid #e2e8f0", borderRadius: 16, fontWeight: 600, cursor: "pointer", fontSize: 12,
+  },
 };
