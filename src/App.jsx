@@ -50,12 +50,37 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
   const days = getDaysInMonth(year, month);
   const sched = {};
   const cnt = Object.fromEntries(members.map(m => [m.id, 0]));
+  const getMember = id => members.find(m => m.id === id);
 
   // Build pairs lookup: member_id → [partner_ids]
   const pairsMap = {};
   for (const p of (pairs || [])) {
     (pairsMap[p.member_id_1] = pairsMap[p.member_id_1] || []).push(p.member_id_2);
     (pairsMap[p.member_id_2] = pairsMap[p.member_id_2] || []).push(p.member_id_1);
+  }
+
+  // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team
+  // This team is reused for Saturday, Sunday, and the preceding Friday
+  const weekendNonDocTeam = {}; // satDay → [memberId, ...]
+  for (let d = 1; d <= days; d++) {
+    if (getDow(year, month, d) !== 6) continue; // only Saturdays
+    const sat = d, sun = d + 1;
+    const satLv = leave[sat] || [];
+    const sunLv = sun <= days ? (leave[sun] || []) : [];
+    // Pick members available on BOTH Sat and Sun (or just Sat if Sun is next month)
+    const availBoth = members.filter(m =>
+      (m.role === "radiologist" || m.role === "nurse") &&
+      !satLv.includes(m.id) &&
+      (sun > days || !sunLv.includes(m.id))
+    );
+    const sel = new Set(), used = new Set(), team = [];
+    const rads = pick(availBoth.filter(m => m.role === "radiologist"), cnt, r.weekend_radiologist,
+      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap);
+    rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
+    const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
+      availBoth.filter(m => m.role === "nurse"), sel, pairsMap);
+    nurses.forEach(m => { team.push(m.id); });
+    weekendNonDocTeam[sat] = team;
   }
 
   for (let d = 1; d <= days; d++) {
@@ -72,49 +97,107 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     const dow = getDow(year, month, d);
     const lv = leave[d] || [];
     const avail = members.filter(m => !lv.includes(m.id));
-    const used = new Set();
     const result = [];
-    const sel = new Set(); // selected this day, for pair boost
+    const sel = new Set();
 
     if (isWeekend(dow)) {
-      const doctors = pick(avail.filter(m => m.role === "doctor"), cnt, r.weekend_doctor,
-        avail.filter(m => m.role === "doctor"), sel, pairsMap);
-      doctors.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      // Doctors: weekend rule
+      pick(avail.filter(m => m.role === "doctor"), cnt, r.weekend_doctor,
+        avail.filter(m => m.role === "doctor"), sel, pairsMap)
+        .forEach(m => { result.push(m.id); sel.add(m.id); });
 
-      const rads = pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
-        avail.filter(m => m.role === "radiologist"), sel, pairsMap);
-      rads.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      // Non-doctors: use the pre-computed shared team (same on Sat and Sun)
+      const satDay = dow === 6 ? d : d - 1;
+      const team = weekendNonDocTeam[satDay] || [];
+      if (team.length > 0) {
+        team.filter(id => !lv.includes(id) && !result.includes(id))
+          .forEach(id => { result.push(id); sel.add(id); });
+      } else {
+        // Fallback: generate independently (e.g. sat was a holiday)
+        const used = new Set(result);
+        pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
+          avail.filter(m => m.role === "radiologist"), sel, pairsMap)
+          .forEach(m => { result.push(m.id); sel.add(m.id); used.add(m.id); });
+        pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
+          avail.filter(m => m.role === "nurse"), sel, pairsMap)
+          .forEach(m => { result.push(m.id); sel.add(m.id); });
+      }
 
-      const nurses = pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
-        avail.filter(m => m.role === "nurse"), sel, pairsMap);
-      nurses.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-
-    } else {
+    } else if (isFriday(dow)) {
       const maxC = r.max_consecutive;
       const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
 
-      // Guaranteed: weekday_doctor doctors
+      // Doctors: weekday rule
       const docPool = avail.filter(m => m.role === "doctor");
-      const doctors = pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap);
-      doctors.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap)
+        .forEach(m => { result.push(m.id); sel.add(m.id); });
 
-      // Guaranteed: at least 1 radiologist
+      // Non-doctors: use the following weekend's team (Sat = d+1)
+      const satDay = d + 1;
+      const team = weekendNonDocTeam[satDay] || [];
+      team.filter(id => !lv.includes(id) && !result.includes(id))
+        .forEach(id => { result.push(id); sel.add(id); });
+
+      // +1 extra rad or nurse (not already in team)
+      const extraPool = avail.filter(m =>
+        (m.role === "radiologist" || m.role === "nurse") &&
+        !result.includes(m.id) && eligible(m)
+      );
+      pick(extraPool, cnt, 1, extraPool, sel, pairsMap)
+        .forEach(m => { result.push(m.id); sel.add(m.id); });
+
+      // Guarantee min 1 rad and 1 nurse on Friday
+      if (!result.some(id => getMember(id)?.role === "radiologist")) {
+        const fb = avail.filter(m => m.role === "radiologist" && !result.includes(m.id));
+        pick(fb, cnt, 1, fb, sel, pairsMap).forEach(m => { result.push(m.id); sel.add(m.id); });
+      }
+      if (!result.some(id => getMember(id)?.role === "nurse")) {
+        const fb = avail.filter(m => m.role === "nurse" && !result.includes(m.id));
+        pick(fb, cnt, 1, fb, sel, pairsMap).forEach(m => { result.push(m.id); sel.add(m.id); });
+      }
+
+      // If no weekend team (Friday at month-end), fill with weekday rad/nurse slots
+      if (team.length === 0) {
+        const used = new Set(result);
+        const filled = result.filter(id => {
+          const role = getMember(id)?.role;
+          return role === "radiologist" || role === "nurse";
+        }).length;
+        const remaining = r.weekday_rad_nurse - filled;
+        if (remaining > 0) {
+          const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id) && eligible(m));
+          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap)
+            .forEach(m => { result.push(m.id); sel.add(m.id); });
+        }
+      }
+
+    } else {
+      // Mon–Thu
+      const maxC = r.max_consecutive;
+      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
+      const used = new Set();
+
+      const docPool = avail.filter(m => m.role === "doctor");
+      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap)
+        .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+
       const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
-      const radsMin = pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap);
-      radsMin.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap)
+        .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
-      // Guaranteed: at least 1 nurse
       const nursePool = avail.filter(m => m.role === "nurse" && !used.has(m.id));
-      const nursesMin = pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap);
-      nursesMin.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap)
+        .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
-      // Fill remaining rad/nurse slots
-      const filled = radsMin.length + nursesMin.length;
+      const filled = result.filter(id => {
+        const role = getMember(id)?.role;
+        return role === "radiologist" || role === "nurse";
+      }).length;
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        const rn = pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap);
-        rn.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap)
+          .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
     }
 
