@@ -942,7 +942,7 @@ export default function CathScheduler() {
                           onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
                           title={editMode && isAdmin ? "點擊移除" : mbr.name}>
                           {editMode && isAdmin && <span style={S.chipRemove}>✕ </span>}
-                          {isMobile ? mbr.name.slice(0, 1) : mbr.name}
+                          {isMobile ? mbr.name.slice(-2) : mbr.name}
                         </span>
                       );
                     })}
@@ -1118,7 +1118,7 @@ export default function CathScheduler() {
                         <span key={mbr.id} onClick={() => isMe && toggleLeave(d, mbr.id)}
                           title={`${mbr.name}：${isMe ? "點擊預假/取消" : "只能操作自己的假"}`}
                           style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: onLeave ? "#fee2e2" : "#f1f5f9", color: onLeave ? "#dc2626" : isMe ? "#334155" : "#94a3b8", border: `1.5px solid ${onLeave ? "#fca5a5" : isMe ? "#cbd5e1" : "#e2e8f0"}`, cursor: isMe ? "pointer" : "default", opacity: isMe || !currentUser ? 1 : 0.45, fontWeight: isMe ? 700 : 400 }}>
-                          {onLeave ? "🚫" : ""}{isMobile ? mbr.name.slice(0, 1) : mbr.name}
+                          {onLeave ? "🚫" : ""}{isMobile ? mbr.name.slice(-2) : mbr.name}
                         </span>
                       );
                     })}
