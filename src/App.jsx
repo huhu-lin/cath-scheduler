@@ -112,18 +112,12 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const avail = members.filter(m => !lv.includes(m.id) && !usedIds.has(m.id));
       const maxC = r.max_consecutive;
       const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
-      const numDoc   = manualIds.filter(id => getMember(id)?.role === "doctor").length;
       const numRad   = manualIds.filter(id => getMember(id)?.role === "radiologist").length;
       const numNurse = manualIds.filter(id => getMember(id)?.role === "nurse").length;
 
       if (isWeekend(getDow(year, month, d))) {
         const satDay = getDow(year, month, d) === 6 ? d : d - 1;
         const preTeam = (weekendNonDocTeam[satDay] || []).filter(id => !usedIds.has(id) && !lv.includes(id));
-        const needDoc = Math.max(0, r.weekend_doctor - numDoc);
-        if (needDoc > 0) {
-          const pool = avail.filter(m => m.role === "doctor");
-          pick(pool, cnt, needDoc, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
         if (preTeam.length > 0) {
           preTeam.forEach(id => { result.push(id); usedIds.add(id); sel.add(id); });
         } else {
@@ -140,11 +134,6 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         }
       } else {
         // Weekday (Mon–Fri): fill to weekday quotas
-        const needDoc = Math.max(0, r.weekday_doctor - numDoc);
-        if (needDoc > 0) {
-          const pool = avail.filter(m => m.role === "doctor");
-          pick(pool.filter(eligible), cnt, needDoc, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
         if (numRad === 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
           pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
@@ -176,11 +165,6 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     const sel = new Set();
 
     if (isWeekend(dow)) {
-      // Doctors: weekend rule
-      pick(avail.filter(m => m.role === "doctor"), cnt, r.weekend_doctor,
-        avail.filter(m => m.role === "doctor"), sel, pairsMap, useRandom)
-        .forEach(m => { result.push(m.id); sel.add(m.id); });
-
       // Non-doctors: use the pre-computed shared team (same on Sat and Sun)
       const satDay = dow === 6 ? d : d - 1;
       const team = weekendNonDocTeam[satDay] || [];
@@ -201,11 +185,6 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     } else if (isFriday(dow)) {
       const maxC = r.max_consecutive;
       const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
-
-      // Doctors: weekday rule
-      const docPool = avail.filter(m => m.role === "doctor");
-      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap, useRandom)
-        .forEach(m => { result.push(m.id); sel.add(m.id); });
 
       // Non-doctors: use the following weekend's team (Sat = d+1)
       const satDay = d + 1;
@@ -251,10 +230,6 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const maxC = r.max_consecutive;
       const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
       const used = new Set();
-
-      const docPool = avail.filter(m => m.role === "doctor");
-      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap, useRandom)
-        .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
       pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, useRandom)
