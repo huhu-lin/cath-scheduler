@@ -32,12 +32,10 @@ function getStreak(sched, day, memberId, year, month, holidayDays) {
 
 // Sort pool: balance (soft cap at floor(avg)+1) > pair bonus > fewer calls
 // useRandom: add small noise so equal-score members get shuffled differently each run
-function sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, globalTarget = null) {
-  const ref = globalTarget !== null
-    ? globalTarget
-    : (pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0);
-  const cap = Math.floor(ref) + 1;
+function sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, personalCap = null) {
+  const poolAvg = pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0;
   const scores = new Map(pool.map(m => {
+    const cap = personalCap ? (personalCap.get(m.id) ?? Math.floor(poolAvg) + 1) : Math.floor(poolAvg) + 1;
     const paired = (pairsMap[m.id] || []).some(pid => selectedIds && selectedIds.has(pid));
     const overCap = (cnt[m.id] || 0) >= cap ? 100000 : 0;
     const noise = useRandom ? Math.random() * 0.9 : 0;
@@ -46,11 +44,11 @@ function sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, globalTarget =
   return pool.slice().sort((a, b) => scores.get(a.id) - scores.get(b.id));
 }
 
-function pick(pool, cnt, n, fallback, selectedIds, pairsMap, useRandom, globalTarget = null) {
-  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, globalTarget);
+function pick(pool, cnt, n, fallback, selectedIds, pairsMap, useRandom, personalCap = null) {
+  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, personalCap);
   return sorted.length >= n
     ? sorted.slice(0, n)
-    : sortByScore(fallback, cnt, selectedIds, pairsMap, useRandom, globalTarget).slice(0, n);
+    : sortByScore(fallback, cnt, selectedIds, pairsMap, useRandom, personalCap).slice(0, n);
 }
 
 function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom) {
@@ -115,22 +113,35 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     }
   }
 
-  // Compute a fixed global target shift count per non-doctor member.
-  // Using a fixed cap prevents the dynamic poolAvg from rising as assignments
-  // accumulate, keeping the over-cap penalty consistently effective.
-  let autoFillDays = 0;
+  // Compute per-person shift targets: total shifts / staff count.
+  // e.g. 20 weekdays×3 + 9 weekends×2 = 78 / 9 staff = 8.67 → 6 people get 9, 3 get 8.
+  // Randomly decide who gets the extra day so the gap is always ≤ 1.
+  let totalNonDoctorShifts = 0;
   for (let d = 1; d <= days; d++) {
-    if (lockedDays && lockedDays.has(d)) continue;
-    if (holidayDays && holidayDays.has(d)) continue;
-    if (isWeekend(getDow(year, month, d))) continue;
-    autoFillDays++;
+    const dow = getDow(year, month, d);
+    if (holidayDays && holidayDays.has(d)) {
+      const ids = (manualSchedule && manualSchedule[d]) ? [...manualSchedule[d]] : (existingSched[d] || []);
+      totalNonDoctorShifts += ids.filter(id => members.find(m => m.id === id)?.role !== "doctor").length;
+    } else if (isWeekend(dow)) {
+      totalNonDoctorShifts += r.weekend_radiologist + r.weekend_nurse;
+    } else {
+      totalNonDoctorShifts += r.weekday_rad_nurse;
+    }
   }
   const nonDoctors = members.filter(m => m.role !== "doctor");
-  const totalPreSeeded = nonDoctors.reduce((sum, m) => sum + (cnt[m.id] || 0), 0);
-  const totalAutoSlots = autoFillDays * r.weekday_rad_nurse;
-  const globalTarget = nonDoctors.length > 0
-    ? (totalPreSeeded + totalAutoSlots) / nonDoctors.length
-    : null;
+  let personalCap = null;
+  if (nonDoctors.length > 0) {
+    const base = Math.floor(totalNonDoctorShifts / nonDoctors.length);
+    const extra = totalNonDoctorShifts - base * nonDoctors.length;
+    const shuffled = [...nonDoctors];
+    if (useRandom) {
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+    }
+    personalCap = new Map(shuffled.map((m, i) => [m.id, i < extra ? base + 1 : base]));
+  }
 
   for (let d = 1; d <= days; d++) {
     if (lockedDays && lockedDays.has(d)) {
@@ -158,27 +169,27 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const needNurse = Math.max(0, r.weekend_nurse - numNurse);
         if (needRad > 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (needNurse > 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
       } else {
         // Weekday (Mon–Fri): fill to weekday quotas
         if (numRad === 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (numNurse === 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
         const remaining = r.weekday_rad_nurse - currentRN;
         if (remaining > 0) {
           const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
         }
       }
       sched[d] = result;
@@ -208,10 +219,10 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         // Fallback: generate independently (e.g. sat was a holiday)
         const used = new Set(result);
         pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
-          avail.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom, globalTarget)
+          avail.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); sel.add(m.id); used.add(m.id); });
         pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
-          avail.filter(m => m.role === "nurse"), sel, pairsMap, useRandom, globalTarget)
+          avail.filter(m => m.role === "nurse"), sel, pairsMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); sel.add(m.id); });
       }
 
@@ -230,17 +241,17 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         (m.role === "radiologist" || m.role === "nurse") &&
         !result.includes(m.id) && eligible(m)
       );
-      pick(extraPool, cnt, 1, extraPool, sel, pairsMap, useRandom, globalTarget)
+      pick(extraPool, cnt, 1, extraPool, sel, pairsMap, useRandom, personalCap)
         .forEach(m => { result.push(m.id); sel.add(m.id); });
 
       // Guarantee min 1 rad and 1 nurse on Friday
       if (!result.some(id => getMember(id)?.role === "radiologist")) {
         const fb = avail.filter(m => m.role === "radiologist" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); sel.add(m.id); });
+        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
       }
       if (!result.some(id => getMember(id)?.role === "nurse")) {
         const fb = avail.filter(m => m.role === "nurse" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, globalTarget).forEach(m => { result.push(m.id); sel.add(m.id); });
+        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
       }
 
       // If no weekend team (Friday at month-end), fill with weekday rad/nurse slots
@@ -253,7 +264,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const remaining = r.weekday_rad_nurse - filled;
         if (remaining > 0) {
           const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id) && eligible(m));
-          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap, useRandom, globalTarget)
+          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap, useRandom, personalCap)
             .forEach(m => { result.push(m.id); sel.add(m.id); });
         }
       }
@@ -265,11 +276,11 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const used = new Set();
 
       const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
-      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, useRandom, globalTarget)
+      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, useRandom, personalCap)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const nursePool = avail.filter(m => m.role === "nurse" && !used.has(m.id));
-      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap, useRandom, globalTarget)
+      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap, useRandom, personalCap)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const filled = result.filter(id => {
@@ -279,7 +290,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, useRandom, globalTarget)
+        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
     }
