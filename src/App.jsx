@@ -8,7 +8,7 @@ const supabase = createClient(
 
 const ROLES = ["doctor", "radiologist", "nurse", "other"];
 const ROLE_LABELS = { doctor: "醫師", radiologist: "放射師", nurse: "護理師", other: "其他" };
-const ROLE_COLORS = { doctor: "#dc2626", radiologist: "#0891b2", nurse: "#7c3aed", other: "#64748b" };
+const ROLE_COLORS = { doctor: "#16a34a", radiologist: "#1d4ed8", nurse: "#dc2626", other: "#64748b" };
 const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706","#db2777","#0284c7","#9333ea"];
 const DEFAULT_RULES = { weekday_doctor:1, weekday_rad_nurse:3, weekend_doctor:1, weekend_radiologist:1, weekend_nurse:1, max_consecutive:2 };
 
@@ -29,35 +29,41 @@ function getStreak(sched, day, memberId, year, month, holidayDays) {
   return s;
 }
 
-// Sort pool: higher preference_weight = scheduled first; among same weight, fewer calls = first
-function sortByScore(pool, cnt) {
+// Sort pool: pair bonus > preference_weight > fewer calls
+function sortByScore(pool, cnt, selectedIds, pairsMap) {
   return pool.slice().sort((a, b) => {
-    const sa = cnt[a.id] - (a.preference_weight || 0) * 100;
-    const sb = cnt[b.id] - (b.preference_weight || 0) * 100;
+    const paired = id => (pairsMap[id] || []).some(pid => selectedIds && selectedIds.has(pid));
+    const sa = cnt[a.id] - (a.preference_weight || 0) * 100 - (paired(a.id) ? 500 : 0);
+    const sb = cnt[b.id] - (b.preference_weight || 0) * 100 - (paired(b.id) ? 500 : 0);
     return sa - sb;
   });
 }
 
-// Pick N people from pool, falling back to full pool if not enough eligible
-function pick(pool, cnt, n, fallback) {
-  const sorted = sortByScore(pool, cnt);
-  return sorted.length >= n ? sorted.slice(0, n) : sortByScore(fallback, cnt).slice(0, n);
+// Pick N from pool (with pair boost); fall back to fallback pool if not enough
+function pick(pool, cnt, n, fallback, selectedIds, pairsMap) {
+  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap);
+  return sorted.length >= n ? sorted.slice(0, n) : sortByScore(fallback, cnt, selectedIds, pairsMap).slice(0, n);
 }
 
-function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules) {
+function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs) {
   const r = rules || DEFAULT_RULES;
   const days = getDaysInMonth(year, month);
   const sched = {};
   const cnt = Object.fromEntries(members.map(m => [m.id, 0]));
 
+  // Build pairs lookup: member_id → [partner_ids]
+  const pairsMap = {};
+  for (const p of (pairs || [])) {
+    (pairsMap[p.member_id_1] = pairsMap[p.member_id_1] || []).push(p.member_id_2);
+    (pairsMap[p.member_id_2] = pairsMap[p.member_id_2] || []).push(p.member_id_1);
+  }
+
   for (let d = 1; d <= days; d++) {
-    // Locked days: keep as-is
     if (lockedDays && lockedDays.has(d)) {
       sched[d] = existingSched[d] || [];
       sched[d].forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
       continue;
     }
-    // National holidays: keep existing (manually scheduled)
     if (holidayDays && holidayDays.has(d)) {
       sched[d] = existingSched[d] || [];
       continue;
@@ -68,44 +74,33 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     const avail = members.filter(m => !lv.includes(m.id));
     const used = new Set();
     const result = [];
+    const sel = new Set(); // selected this day, for pair boost
 
     if (isWeekend(dow)) {
-      // Weekend: weekday_doctor doctors + weekend_radiologist rads + weekend_nurse nurses
-      const doctors = pick(
-        avail.filter(m => m.role === "doctor"),
-        cnt, r.weekend_doctor,
-        avail.filter(m => m.role === "doctor")
-      );
-      doctors.forEach(m => { result.push(m.id); used.add(m.id); });
+      const doctors = pick(avail.filter(m => m.role === "doctor"), cnt, r.weekend_doctor,
+        avail.filter(m => m.role === "doctor"), sel, pairsMap);
+      doctors.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
-      const rads = pick(
-        avail.filter(m => m.role === "radiologist" && !used.has(m.id)),
-        cnt, r.weekend_radiologist,
-        avail.filter(m => m.role === "radiologist")
-      );
-      rads.forEach(m => { result.push(m.id); used.add(m.id); });
+      const rads = pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
+        avail.filter(m => m.role === "radiologist"), sel, pairsMap);
+      rads.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
-      const nurses = pick(
-        avail.filter(m => m.role === "nurse" && !used.has(m.id)),
-        cnt, r.weekend_nurse,
-        avail.filter(m => m.role === "nurse")
-      );
-      nurses.forEach(m => { result.push(m.id); used.add(m.id); });
+      const nurses = pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
+        avail.filter(m => m.role === "nurse"), sel, pairsMap);
+      nurses.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
     } else {
-      // Weekday: weekday_doctor doctors + weekday_rad_nurse from rad+nurse pool
-      // Consecutive limit applies; exempt on national holidays (already handled above)
       const maxC = r.max_consecutive;
 
       const docPool = avail.filter(m => m.role === "doctor");
       const docEligible = docPool.filter(m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC);
-      const doctors = pick(docEligible, cnt, r.weekday_doctor, docPool);
-      doctors.forEach(m => { result.push(m.id); used.add(m.id); });
+      const doctors = pick(docEligible, cnt, r.weekday_doctor, docPool, sel, pairsMap);
+      doctors.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
       const rnEligible = rnPool.filter(m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC);
-      const rn = pick(rnEligible, cnt, r.weekday_rad_nurse, rnPool);
-      rn.forEach(m => { result.push(m.id); used.add(m.id); });
+      const rn = pick(rnEligible, cnt, r.weekday_rad_nurse, rnPool, sel, pairsMap);
+      rn.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
     }
 
     sched[d] = result;
@@ -162,6 +157,12 @@ async function dbFetchRules() {
   return data || DEFAULT_RULES;
 }
 
+async function dbFetchPairs() {
+  const { data, error } = await supabase.from("member_pairs").select("*");
+  if (error) throw error;
+  return data;
+}
+
 // ── Constants ───────────────────────────────────────────────
 const DOW_LABELS = ["日","一","二","三","四","五","六"];
 const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
@@ -194,10 +195,6 @@ function MemberForm({ member, onChange, onSave, onCancel, saving }) {
         <select style={S.formSelect} value={member.preference_weight || 0} onChange={e => onChange({ ...member, preference_weight: parseInt(e.target.value) })}>
           {PREF_LABELS.map((l, i) => <option key={i} value={i}>{l}</option>)}
         </select>
-      </div>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>顏色</label>
-        <input type="color" value={member.color} onChange={e => onChange({ ...member, color: e.target.value })} style={{ width: 40, height: 32, border: "none", cursor: "pointer" }} />
       </div>
       <div style={S.formRow}>
         <label style={S.formLabel}>管理員</label>
@@ -254,6 +251,11 @@ export default function CathScheduler() {
   const [editingRules, setEditingRules] = useState(null);
   const [rulesSaving, setRulesSaving]   = useState(false);
 
+  // Pairs
+  const [pairs, setPairs]             = useState([]);
+  const [newPair, setNewPair]         = useState({ a: "", b: "" });
+  const [pairSaving, setPairSaving]   = useState(false);
+
   const isAdmin = !!session && (currentUser?.is_admin ?? false);
 
   const notify = (msg, type = "ok") => {
@@ -306,15 +308,16 @@ export default function CathScheduler() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [mData, { schedule: sData, lockedDays: ld }, lData, hData, rData] = await Promise.all([
+      const [mData, { schedule: sData, lockedDays: ld }, lData, hData, rData, pData] = await Promise.all([
         dbFetchMembers(),
         dbFetchSchedule(year, month),
         dbFetchLeave(year, month),
         dbFetchHolidays(year),
         dbFetchRules(),
+        dbFetchPairs(),
       ]);
       setMembers(mData); setSchedule(sData); setLockedDays(ld);
-      setLeaveMap(lData); setHolidays(hData); setRules(rData);
+      setLeaveMap(lData); setHolidays(hData); setRules(rData); setPairs(pData);
     } catch (e) { notify("⚠️ 載入失敗：" + e.message, "err"); }
     setLoading(false);
   }, [year, month]);
@@ -401,7 +404,7 @@ export default function CathScheduler() {
     const holidayDays = new Set(
       holidays.filter(h => h.year === year && h.month === month + 1).map(h => h.day)
     );
-    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules);
+    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules, pairs);
     saveFullSchedule(gen);
   }
 
@@ -485,6 +488,36 @@ export default function CathScheduler() {
     setRulesSaving(false);
   }
 
+  // ── Pair CRUD ────────────────────────────────────────────────
+  async function addPair() {
+    const { a, b } = newPair;
+    if (!a || !b || a === b) { notify("請選擇兩位不同的成員", "err"); return; }
+    const id1 = a < b ? a : b;
+    const id2 = a < b ? b : a;
+    if (pairs.some(p => p.member_id_1 === id1 && p.member_id_2 === id2)) {
+      notify("此配對已存在", "err"); return;
+    }
+    setPairSaving(true);
+    try {
+      const { data, error } = await supabase.from("member_pairs")
+        .insert({ member_id_1: id1, member_id_2: id2 }).select().single();
+      if (error) throw error;
+      setPairs(prev => [...prev, data]);
+      setNewPair({ a: "", b: "" });
+      notify("✅ 配對已新增");
+    } catch (e) { notify("❌ 新增失敗：" + e.message, "err"); }
+    setPairSaving(false);
+  }
+
+  async function deletePair(id) {
+    try {
+      const { error } = await supabase.from("member_pairs").delete().eq("id", id);
+      if (error) throw error;
+      setPairs(prev => prev.filter(p => p.id !== id));
+      notify("🗑️ 配對已刪除");
+    } catch (e) { notify("❌ 刪除失敗：" + e.message, "err"); }
+  }
+
   // ── Helpers ─────────────────────────────────────────────────
   function getMember(id) { return members.find(m => m.id === id); }
 
@@ -526,7 +559,7 @@ export default function CathScheduler() {
           {session ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <div style={S.userInfo}>
-                {currentUser && <span style={{ ...S.dot, background: currentUser.color }} />}
+                {currentUser && <span style={{ ...S.dot, background: ROLE_COLORS[currentUser.role] }} />}
                 <span style={S.userName}>{currentUser?.name ?? session.user.email}</span>
                 <span style={S.adminBadge}>管理員</span>
               </div>
@@ -535,7 +568,7 @@ export default function CathScheduler() {
           ) : (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <button style={S.userBtn} onClick={() => setShowUserPicker(true)}>
-                {currentUser ? <><span style={{ ...S.dot, background: currentUser.color }} />{currentUser.name}</> : "選擇身份"}
+                {currentUser ? <><span style={{ ...S.dot, background: ROLE_COLORS[currentUser.role] }} />{currentUser.name}</> : "選擇身份"}
               </button>
               <button style={S.adminLoginBtn} onClick={() => { setShowAuthModal(true); setAuthError(""); }}>
                 🔐 管理員登入
@@ -553,9 +586,9 @@ export default function CathScheduler() {
             <div style={{ fontSize: 13, color: "#64748b", marginBottom: 14 }}>選擇身份後可在「🙋 預假」頁提交請假</div>
             <div style={S.modalGrid}>
               {members.map(m => (
-                <button key={m.id} style={{ ...S.memberPickBtn, borderColor: m.color + "80" }}
+                <button key={m.id} style={{ ...S.memberPickBtn, borderColor: ROLE_COLORS[m.role] + "80" }}
                   onClick={() => { setCurrentUser(m); setShowUserPicker(false); }}>
-                  <span style={{ ...S.dot, background: m.color }} />
+                  <span style={{ ...S.dot, background: ROLE_COLORS[m.role] }} />
                   <span style={S.pickName}>{m.name}</span>
                   <span style={{ ...S.roleTag, background: ROLE_COLORS[m.role] + "18", color: ROLE_COLORS[m.role] }}>{ROLE_LABELS[m.role]}</span>
                 </button>
@@ -665,7 +698,7 @@ export default function CathScheduler() {
                       if (!mbr) return null;
                       return (
                         <span key={id}
-                          style={{ ...S.chip, background: mbr.color + "22", color: mbr.color, border: `1.5px solid ${mbr.color}55`, ...(editMode && isAdmin ? S.chipEditable : {}) }}
+                          style={{ ...S.chip, background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}) }}
                           onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
                           title={editMode && isAdmin ? "點擊移除" : undefined}>
                           {editMode && isAdmin && <span style={S.chipRemove}>✕ </span>}
@@ -701,7 +734,7 @@ export default function CathScheduler() {
                   const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
                   return (
                     <button key={mbr.id} disabled={lv || saving} title={lv ? "請假中" : on ? "點擊移除" : "點擊加入"}
-                      style={{ ...S.memberToggle, ...(on ? { background: mbr.color, color: "#fff", borderColor: mbr.color, boxShadow: `0 2px 8px ${mbr.color}50` } : {}), ...(lv ? S.memberOnLeave : {}) }}
+                      style={{ ...S.memberToggle, ...(on ? { background: ROLE_COLORS[mbr.role], color: "#fff", borderColor: ROLE_COLORS[mbr.role], boxShadow: `0 2px 8px ${ROLE_COLORS[mbr.role]}50` } : {}), ...(lv ? S.memberOnLeave : {}) }}
                       onClick={() => !lv && !saving && toggleAssign(selectedDay, mbr.id)}>
                       <span>{lv ? "🚫" : on ? "✓ " : "+ "}</span>
                       <span>{mbr.name}</span>
@@ -787,16 +820,16 @@ export default function CathScheduler() {
               const max = Math.max(...Object.values(callCount), 1);
               return (
                 <div key={mbr.id} style={S.statCard}>
-                  <div style={{ ...S.statBar, width: `${(cnt / max) * 100}%`, background: mbr.color + "28" }} />
+                  <div style={{ ...S.statBar, width: `${(cnt / max) * 100}%`, background: ROLE_COLORS[mbr.role] + "28" }} />
                   <div style={S.statInfo}>
-                    <span style={{ ...S.dot, background: mbr.color, width: 14, height: 14 }} />
+                    <span style={{ ...S.dot, background: ROLE_COLORS[mbr.role], width: 14, height: 14 }} />
                     <span style={S.statName}>{mbr.name}</span>
                     <span style={{ ...S.roleTag, background: ROLE_COLORS[mbr.role] + "18", color: ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
                     {(mbr.preference_weight || 0) > 0 && (
                       <span style={S.prefBadge}>{PREF_LABELS[mbr.preference_weight]}</span>
                     )}
                   </div>
-                  <div style={{ ...S.statCount, color: mbr.color }}>{cnt} 次</div>
+                  <div style={{ ...S.statCount, color: ROLE_COLORS[mbr.role] }}>{cnt} 次</div>
                 </div>
               );
             })}
@@ -812,7 +845,7 @@ export default function CathScheduler() {
       {view === "admin" && isAdmin && (
         <div style={S.content}>
           <div style={S.adminTabs}>
-            {[["members","👥 人員管理"],["rules","📋 排班規則"],["holidays","🎌 國定假日"]].map(([t, l]) => (
+            {[["members","👥 人員管理"],["rules","📋 排班規則"],["pairs","🤝 偏好配對"],["holidays","🎌 國定假日"]].map(([t, l]) => (
               <button key={t} style={{ ...S.adminTabBtn, ...(adminTab === t ? S.adminTabActive : {}) }}
                 onClick={() => setAdminTab(t)}>{l}</button>
             ))}
@@ -842,7 +875,7 @@ export default function CathScheduler() {
                     <MemberForm member={editingMember} onChange={setEditingMember} onSave={() => saveMember(editingMember)} onCancel={() => setEditingMember(null)} saving={memberSaving} />
                   ) : (
                     <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                      <span style={{ ...S.dot, background: m.color, width: 14, height: 14, flexShrink: 0 }} />
+                      <span style={{ ...S.dot, background: ROLE_COLORS[m.role], width: 14, height: 14, flexShrink: 0 }} />
                       <span style={{ fontWeight: 700, fontSize: 15, flex: 1, minWidth: 60 }}>{m.name}</span>
                       <span style={{ ...S.roleTag, background: ROLE_COLORS[m.role] + "18", color: ROLE_COLORS[m.role] }}>{ROLE_LABELS[m.role]}</span>
                       {m.is_admin && <span style={S.adminBadge}>管理員</span>}
@@ -973,6 +1006,66 @@ export default function CathScheduler() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Pairs tab */}
+          {adminTab === "pairs" && (
+            <div style={S.adminSection}>
+              <div style={S.sectionTitle}>偏好配對設定</div>
+              <div style={{ fontSize: 13, color: "#64748b", marginBottom: 14 }}>
+                配對的兩位成員在自動排班時會被優先安排在同一天值班。
+              </div>
+
+              {/* Add pair form */}
+              <div style={{ ...S.formBox, display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 120 }}>
+                  <div style={S.formLabel}>成員 A</div>
+                  <select style={S.formSelect} value={newPair.a}
+                    onChange={e => setNewPair(p => ({ ...p, a: e.target.value }))}>
+                    <option value="">— 選擇 —</option>
+                    {members.map(m => (
+                      <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ fontSize: 20, paddingBottom: 6, color: "#94a3b8" }}>↔</div>
+                <div style={{ flex: 1, minWidth: 120 }}>
+                  <div style={S.formLabel}>成員 B</div>
+                  <select style={S.formSelect} value={newPair.b}
+                    onChange={e => setNewPair(p => ({ ...p, b: e.target.value }))}>
+                    <option value="">— 選擇 —</option>
+                    {members.filter(m => m.id !== newPair.a).map(m => (
+                      <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>
+                    ))}
+                  </select>
+                </div>
+                <button style={S.btnPrimary} onClick={addPair} disabled={pairSaving || !newPair.a || !newPair.b}>
+                  {pairSaving ? "新增中…" : "+ 新增配對"}
+                </button>
+              </div>
+
+              {pairs.length === 0 && (
+                <div style={{ color: "#94a3b8", fontSize: 14, padding: "12px 0" }}>尚未設定任何偏好配對</div>
+              )}
+              {pairs.map(p => {
+                const m1 = getMember(p.member_id_1);
+                const m2 = getMember(p.member_id_2);
+                if (!m1 || !m2) return null;
+                return (
+                  <div key={p.id} style={{ ...S.memberCard, display: "flex", alignItems: "center", gap: 12 }}>
+                    <span style={{ ...S.dot, background: ROLE_COLORS[m1.role], width: 10, height: 10 }} />
+                    <span style={{ fontWeight: 700, fontSize: 14 }}>{m1.name}</span>
+                    <span style={{ ...S.roleTag, background: ROLE_COLORS[m1.role] + "18", color: ROLE_COLORS[m1.role] }}>{ROLE_LABELS[m1.role]}</span>
+                    <span style={{ color: "#94a3b8", fontSize: 18 }}>↔</span>
+                    <span style={{ ...S.dot, background: ROLE_COLORS[m2.role], width: 10, height: 10 }} />
+                    <span style={{ fontWeight: 700, fontSize: 14 }}>{m2.name}</span>
+                    <span style={{ ...S.roleTag, background: ROLE_COLORS[m2.role] + "18", color: ROLE_COLORS[m2.role] }}>{ROLE_LABELS[m2.role]}</span>
+                    <button style={{ ...S.btnSmall, marginLeft: "auto", color: "#dc2626", borderColor: "#fca5a5" }}
+                      onClick={() => deletePair(p.id)}>刪除</button>
+                  </div>
+                );
+              })}
             </div>
           )}
 
