@@ -716,7 +716,7 @@ export default function CathScheduler() {
             })}
           </div>
 
-          {selectedDay && !editMode && isAdmin && (
+          {selectedDay && !editMode && (
             <div style={S.panel}>
               <div style={S.panelHeader}>
                 <div style={S.panelTitle}>
@@ -727,22 +727,59 @@ export default function CathScheduler() {
                 </div>
                 <button style={S.panelClose} onClick={() => setSelectedDay(null)}>✕</button>
               </div>
-              <div style={S.panelLabel}>📋 On-Call 人員</div>
-              <div style={S.memberRow}>
-                {members.map(mbr => {
-                  const on = (schedule[selectedDay] || []).includes(mbr.id);
-                  const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
-                  return (
-                    <button key={mbr.id} disabled={lv || saving} title={lv ? "請假中" : on ? "點擊移除" : "點擊加入"}
-                      style={{ ...S.memberToggle, ...(on ? { background: ROLE_COLORS[mbr.role], color: "#fff", borderColor: ROLE_COLORS[mbr.role], boxShadow: `0 2px 8px ${ROLE_COLORS[mbr.role]}50` } : {}), ...(lv ? S.memberOnLeave : {}) }}
-                      onClick={() => !lv && !saving && toggleAssign(selectedDay, mbr.id)}>
-                      <span>{lv ? "🚫" : on ? "✓ " : "+ "}</span>
-                      <span>{mbr.name}</span>
-                      <span style={{ ...S.roleTag, background: on ? "#fff3" : ROLE_COLORS[mbr.role] + "18", color: on ? "#fff" : ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
-                    </button>
-                  );
-                })}
-              </div>
+
+              {/* On-call list with phone — visible to all */}
+              <div style={S.panelLabel}>📋 今日 On-Call</div>
+              {(schedule[selectedDay] || []).length === 0
+                ? <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12 }}>尚未排班</div>
+                : (
+                  <div style={S.oncallList}>
+                    {(schedule[selectedDay] || []).map(id => {
+                      const mbr = getMember(id);
+                      if (!mbr) return null;
+                      const color = ROLE_COLORS[mbr.role];
+                      return (
+                        <div key={id} style={{ ...S.oncallCard, borderLeftColor: color }}>
+                          <div style={S.oncallCardLeft}>
+                            <span style={{ ...S.roleTag, background: color + "18", color }}>{ROLE_LABELS[mbr.role]}</span>
+                            <span style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>{mbr.name}</span>
+                          </div>
+                          {mbr.phone ? (
+                            <a href={`tel:${mbr.phone}`} style={{ ...S.phoneBtn, borderColor: color + "60", color }}>
+                              📞 {mbr.phone}
+                            </a>
+                          ) : (
+                            <span style={{ fontSize: 12, color: "#cbd5e1" }}>無電話</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+              {/* Admin edit controls */}
+              {isAdmin && (
+                <>
+                  <div style={{ ...S.panelLabel, marginTop: 14, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
+                    ✏️ 編輯值班人員
+                  </div>
+                  <div style={S.memberRow}>
+                    {members.map(mbr => {
+                      const on = (schedule[selectedDay] || []).includes(mbr.id);
+                      const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
+                      return (
+                        <button key={mbr.id} disabled={lv || saving} title={lv ? "請假中" : on ? "點擊移除" : "點擊加入"}
+                          style={{ ...S.memberToggle, ...(on ? { background: ROLE_COLORS[mbr.role], color: "#fff", borderColor: ROLE_COLORS[mbr.role], boxShadow: `0 2px 8px ${ROLE_COLORS[mbr.role]}50` } : {}), ...(lv ? S.memberOnLeave : {}) }}
+                          onClick={() => !lv && !saving && toggleAssign(selectedDay, mbr.id)}>
+                          <span>{lv ? "🚫" : on ? "✓ " : "+ "}</span>
+                          <span>{mbr.name}</span>
+                          <span style={{ ...S.roleTag, background: on ? "#fff3" : ROLE_COLORS[mbr.role] + "18", color: on ? "#fff" : ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -1178,6 +1215,10 @@ const S = {
   panelBadgeHol: { fontSize: 12, background: "#fff1f2", color: "#dc2626", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
   panelClose: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" },
   panelLabel: { fontSize: 13, color: "#64748b", marginBottom: 10, fontWeight: 600 },
+  oncallList: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 4 },
+  oncallCard: { display: "flex", alignItems: "center", justifyContent: "space-between", background: "#f8fafc", borderRadius: 10, padding: "10px 14px", borderLeft: "4px solid #e2e8f0", gap: 10 },
+  oncallCardLeft: { display: "flex", alignItems: "center", gap: 8, flex: 1 },
+  phoneBtn: { display: "inline-flex", alignItems: "center", gap: 4, padding: "7px 14px", borderRadius: 20, border: "1.5px solid", background: "#fff", fontWeight: 700, fontSize: 14, textDecoration: "none", flexShrink: 0, whiteSpace: "nowrap" },
   memberRow: { display: "flex", flexWrap: "wrap", gap: 8 },
   memberToggle: { padding: "8px 14px", borderRadius: 20, border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#334155", cursor: "pointer", fontSize: 13, fontWeight: 600, transition: "all 0.15s", display: "flex", alignItems: "center", gap: 5 },
   memberOnLeave: { opacity: 0.3, cursor: "not-allowed" },
