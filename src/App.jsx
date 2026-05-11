@@ -103,8 +103,14 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
 
   for (let d = 1; d <= days; d++) {
     if (lockedDays && lockedDays.has(d)) {
-      // Keep manually-assigned members; auto-fill the remaining slots
       const manualIds = (manualSchedule && manualSchedule[d]) ? [...manualSchedule[d]] : (existingSched[d] || []);
+      // On holidays, keep only the manual assignments — no auto-fill
+      if (holidayDays && holidayDays.has(d)) {
+        sched[d] = manualIds;
+        manualIds.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+        continue;
+      }
+      // Keep manually-assigned members; auto-fill the remaining slots
       const usedIds = new Set(manualIds);
       const result = [...manualIds];
       const sel = new Set(manualIds);
