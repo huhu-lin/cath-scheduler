@@ -45,7 +45,6 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       sched[d] = existingSched[d] || [];
       continue;
     }
-
     const dow = getDow(year, month, d);
     const lv = leave[d] || [];
     const avail = members.filter(mbr => !lv.includes(mbr.id));
@@ -137,6 +136,10 @@ function MemberForm({ member, onChange, onSave, onCancel, saving }) {
         <input style={S.formInput} value={member.phone || ""} onChange={e => onChange({ ...member, phone: e.target.value })} placeholder="選填" />
       </div>
       <div style={S.formRow}>
+        <label style={S.formLabel}>Email</label>
+        <input style={S.formInput} type="email" value={member.email || ""} onChange={e => onChange({ ...member, email: e.target.value })} placeholder="管理員帳號用" />
+      </div>
+      <div style={S.formRow}>
         <label style={S.formLabel}>顏色</label>
         <input type="color" value={member.color} onChange={e => onChange({ ...member, color: e.target.value })} style={{ width: 40, height: 32, border: "none", cursor: "pointer" }} />
       </div>
@@ -170,21 +173,92 @@ export default function CathScheduler() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState(null);
+
+  // Auth state
+  const [session, setSession] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [showUserPicker, setShowUserPicker] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authMode, setAuthMode] = useState("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+
+  // Member admin state
   const [editingMember, setEditingMember] = useState(null);
   const [newMember, setNewMember] = useState(null);
   const [memberSaving, setMemberSaving] = useState(false);
   const [newHoliday, setNewHoliday] = useState({ month: today.getMonth() + 1, day: "", name: "" });
   const [holidaySaving, setHolidaySaving] = useState(false);
 
-  const isAdmin = currentUser?.is_admin ?? false;
+  // isAdmin requires a real Supabase Auth session AND the member must have is_admin=true
+  const isAdmin = !!session && (currentUser?.is_admin ?? false);
 
   const notify = (msg, type = "ok") => {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3000);
   };
 
+  // ── Auth setup ──────────────────────────────────────────────
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setSession(s);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
+      if (!s) setCurrentUser(null);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // When session changes, find matching member by email
+  useEffect(() => {
+    if (session?.user?.email) {
+      supabase.from("members").select("*").eq("email", session.user.email).maybeSingle()
+        .then(({ data }) => {
+          if (data) setCurrentUser(data);
+        });
+    }
+  }, [session]);
+
+  async function handleAuth() {
+    setAuthError("");
+    setAuthLoading(true);
+    try {
+      if (authMode === "login") {
+        const { error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+        if (error) throw error;
+        setShowAuthModal(false);
+        setAuthEmail("");
+        setAuthPassword("");
+      } else {
+        // Sign up: verify the email belongs to an existing admin member
+        const { data: member } = await supabase.from("members")
+          .select("id").eq("email", authEmail).eq("is_admin", true).maybeSingle();
+        if (!member) {
+          throw new Error("此 email 未與任何管理員成員關聯，請先在成員資料中設定 email");
+        }
+        const { error } = await supabase.auth.signUp({ email: authEmail, password: authPassword });
+        if (error) throw error;
+        notify("📧 已送出確認信，請至信箱驗證後再登入");
+        setShowAuthModal(false);
+        setAuthEmail("");
+        setAuthPassword("");
+      }
+    } catch (e) {
+      setAuthError(e.message);
+    }
+    setAuthLoading(false);
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setCurrentUser(null);
+    setView("calendar");
+  }
+
+  // ── Data loading ────────────────────────────────────────────
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
@@ -207,6 +281,7 @@ export default function CathScheduler() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  // ── Schedule operations (admin only) ────────────────────────
   async function saveFullSchedule(newSched) {
     setSaving(true);
     try {
@@ -234,7 +309,7 @@ export default function CathScheduler() {
   }
 
   async function toggleAssign(day, memberId) {
-    if (saving) return;
+    if (saving || !isAdmin) return;
     const arr = schedule[day] ? [...schedule[day]] : [];
     const isOn = arr.includes(memberId);
     setSaving(true);
@@ -298,21 +373,24 @@ export default function CathScheduler() {
     saveFullSchedule(gen);
   }
 
+  // ── Member CRUD (admin only) ────────────────────────────────
   async function saveMember(m) {
     setMemberSaving(true);
     try {
       if (m.id) {
         const { error } = await supabase.from("members").update({
-          name: m.name, role: m.role, phone: m.phone || "", color: m.color, is_admin: !!m.is_admin,
+          name: m.name, role: m.role, phone: m.phone || "",
+          email: m.email || "", color: m.color, is_admin: !!m.is_admin,
         }).eq("id", m.id);
         if (error) throw error;
         setMembers(prev => prev.map(x => x.id === m.id ? { ...x, ...m } : x));
+        if (currentUser?.id === m.id) setCurrentUser(prev => ({ ...prev, ...m }));
       } else {
         const newId = Math.random().toString(36).slice(2, 10);
         const maxOrder = members.reduce((max, x) => Math.max(max, x.sort_order || 0), 0);
         const { data, error } = await supabase.from("members").insert({
           id: newId, name: m.name, role: m.role, phone: m.phone || "",
-          color: m.color, is_admin: !!m.is_admin, sort_order: maxOrder + 1,
+          email: m.email || "", color: m.color, is_admin: !!m.is_admin, sort_order: maxOrder + 1,
         }).select().single();
         if (error) throw error;
         setMembers(prev => [...prev, data]);
@@ -342,6 +420,7 @@ export default function CathScheduler() {
     setMemberSaving(false);
   }
 
+  // ── Holiday CRUD (admin only) ────────────────────────────────
   async function addHoliday() {
     if (!newHoliday.day || !newHoliday.name) { notify("請填寫日期和名稱", "err"); return; }
     setHolidaySaving(true);
@@ -370,6 +449,7 @@ export default function CathScheduler() {
     }
   }
 
+  // ── Helpers ─────────────────────────────────────────────────
   function getMember(id) { return members.find(m => m.id === id); }
 
   function buildCalendar() {
@@ -395,6 +475,7 @@ export default function CathScheduler() {
     holidayMap[h.day] = h.name;
   });
 
+  // ── Render ──────────────────────────────────────────────────
   return (
     <div style={S.root}>
       {toast && (
@@ -403,6 +484,7 @@ export default function CathScheduler() {
         </div>
       )}
 
+      {/* Header */}
       <header style={S.header}>
         <div style={S.headerLeft}>
           <span style={S.logo}>🫀</span>
@@ -413,18 +495,40 @@ export default function CathScheduler() {
         </div>
         <div style={S.headerRight}>
           {saving && <span style={S.savingTxt}>⟳ 儲存中...</span>}
-          <button style={S.userBtn} onClick={() => setShowUserPicker(true)}>
-            {currentUser ? (
-              <><span style={{ ...S.dot, background: currentUser.color }} />{currentUser.name}{currentUser.is_admin && <span style={S.adminBadge}>管理員</span>}</>
-            ) : "選擇身份"}
-          </button>
+          {session ? (
+            // Logged in as admin
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={S.userInfo}>
+                {currentUser && <span style={{ ...S.dot, background: currentUser.color }} />}
+                <span style={S.userName}>{currentUser?.name ?? session.user.email}</span>
+                <span style={S.adminBadge}>管理員</span>
+              </div>
+              <button style={S.logoutBtn} onClick={handleLogout}>登出</button>
+            </div>
+          ) : (
+            // Not logged in
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button style={S.userBtn} onClick={() => setShowUserPicker(true)}>
+                {currentUser
+                  ? <><span style={{ ...S.dot, background: currentUser.color }} />{currentUser.name}</>
+                  : "選擇身份"}
+              </button>
+              <button style={S.adminLoginBtn} onClick={() => { setShowAuthModal(true); setAuthError(""); }}>
+                🔐 管理員登入
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
+      {/* Identity picker modal (for regular members / leave submission) */}
       {showUserPicker && (
         <div style={S.modalOverlay} onClick={() => setShowUserPicker(false)}>
           <div style={S.modalBox} onClick={e => e.stopPropagation()}>
-            <div style={S.modalTitle}>你是誰？</div>
+            <div style={S.modalTitle}>選擇身份（預假用）</div>
+            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 14 }}>
+              選擇身份後可在「🙋 預假」頁提交請假
+            </div>
             <div style={S.modalGrid}>
               {members.map(m => (
                 <button key={m.id}
@@ -442,6 +546,51 @@ export default function CathScheduler() {
         </div>
       )}
 
+      {/* Admin auth modal */}
+      {showAuthModal && (
+        <div style={S.modalOverlay} onClick={() => setShowAuthModal(false)}>
+          <div style={{ ...S.modalBox, maxWidth: 360 }} onClick={e => e.stopPropagation()}>
+            <div style={S.modalTitle}>
+              {authMode === "login" ? "🔐 管理員登入" : "📝 建立管理員帳號"}
+            </div>
+
+            {authMode === "signup" && (
+              <div style={S.authHint}>
+                建立帳號前，請先在「⚙️ 管理 → 人員管理」中，將你的 email 填入對應的成員資料，並勾選管理員。
+              </div>
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <input
+                style={S.authInput}
+                type="email"
+                placeholder="Email"
+                value={authEmail}
+                onChange={e => setAuthEmail(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && handleAuth()}
+                autoFocus
+              />
+              <input
+                style={S.authInput}
+                type="password"
+                placeholder="密碼"
+                value={authPassword}
+                onChange={e => setAuthPassword(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && handleAuth()}
+              />
+              {authError && <div style={S.authError}>{authError}</div>}
+              <button style={S.btnPrimary} onClick={handleAuth} disabled={authLoading || !authEmail || !authPassword}>
+                {authLoading ? "處理中…" : authMode === "login" ? "登入" : "建立帳號"}
+              </button>
+              <button style={S.authSwitchBtn} onClick={() => { setAuthMode(m => m === "login" ? "signup" : "login"); setAuthError(""); }}>
+                {authMode === "login" ? "尚未建立帳號？建立管理員帳號" : "已有帳號？返回登入"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Nav */}
       <nav style={S.nav}>
         {[["calendar","📅 班表"],["leave","🙋 預假"],["stats","📊 統計"]].map(([v, l]) => (
           <button key={v}
@@ -459,6 +608,7 @@ export default function CathScheduler() {
         )}
       </nav>
 
+      {/* Month navigator */}
       <div style={S.monthNav}>
         <button style={S.arrowBtn} onClick={() => {
           setSelectedDay(null); setEditMode(false);
@@ -490,7 +640,7 @@ export default function CathScheduler() {
 
       {editMode && view === "calendar" && (
         <div style={S.editBanner}>
-          ✏️ 手動調整模式：點擊日期格子中的人員姓名來加入 / 移除（已鎖定日期 🔒 不受自動排班影響）
+          ✏️ 手動調整模式：點擊日期格子中的人員姓名來加入 / 移除（🔒 已鎖定日期不受自動排班影響）
         </div>
       )}
 
@@ -549,11 +699,11 @@ export default function CathScheduler() {
                             background: mbr.color + "22",
                             color: mbr.color,
                             border: `1.5px solid ${mbr.color}55`,
-                            ...(editMode ? S.chipEditable : {}),
+                            ...(editMode && isAdmin ? S.chipEditable : {}),
                           }}
-                          onClick={editMode ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
-                          title={editMode ? "點擊移除" : undefined}>
-                          {editMode && <span style={S.chipRemove}>✕ </span>}
+                          onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
+                          title={editMode && isAdmin ? "點擊移除" : undefined}>
+                          {editMode && isAdmin && <span style={S.chipRemove}>✕ </span>}
                           {mbr.name}
                         </span>
                       );
@@ -649,7 +799,7 @@ export default function CathScheduler() {
           <div style={S.leaveNote}>
             {currentUser
               ? `身份：${currentUser.name}　點擊自己的名字來預假 / 取消`
-              : "⬆ 請先點右上角選擇身份，再操作預假"}
+              : "⬆ 請先點右上角「選擇身份」，再操作預假"}
           </div>
           <div style={S.calGrid}>
             {DOW_LABELS.map((d, i) => (
@@ -747,7 +897,8 @@ export default function CathScheduler() {
                 <div style={S.sectionTitle}>成員名單</div>
                 {!newMember && (
                   <button style={S.btnPrimary} onClick={() => setNewMember({
-                    name: "", role: "nurse", phone: "", color: DEFAULT_COLORS[members.length % DEFAULT_COLORS.length], is_admin: false,
+                    name: "", role: "nurse", phone: "", email: "",
+                    color: DEFAULT_COLORS[members.length % DEFAULT_COLORS.length], is_admin: false,
                   })}>
                     + 新增成員
                   </button>
@@ -785,6 +936,7 @@ export default function CathScheduler() {
                         {ROLE_LABELS[m.role]}
                       </span>
                       {m.is_admin && <span style={S.adminBadge}>管理員</span>}
+                      {m.email && <span style={{ fontSize: 12, color: "#94a3b8" }}>✉ {m.email}</span>}
                       {m.phone && <span style={{ fontSize: 13, color: "#64748b" }}>📞 {m.phone}</span>}
                       <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
                         <button style={S.btnSmall} onClick={() => setEditingMember({ ...m })}>編輯</button>
@@ -838,13 +990,9 @@ export default function CathScheduler() {
               {holidays.filter(h => h.year === year).map(h => (
                 <div key={h.id} style={{ ...S.memberCard, display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ fontSize: 18 }}>🎌</span>
-                  <span style={{ fontWeight: 700, color: "#dc2626", minWidth: 60 }}>
-                    {h.month}/{h.day}
-                  </span>
+                  <span style={{ fontWeight: 700, color: "#dc2626", minWidth: 60 }}>{h.month}/{h.day}</span>
                   <span style={{ flex: 1, fontSize: 14 }}>{h.name}</span>
-                  <span style={{ fontSize: 12, color: "#94a3b8" }}>
-                    ({DOW_LABELS[getDow(h.year, h.month - 1, h.day)]})
-                  </span>
+                  <span style={{ fontSize: 12, color: "#94a3b8" }}>({DOW_LABELS[getDow(h.year, h.month - 1, h.day)]})</span>
                   <button style={{ ...S.btnSmall, color: "#dc2626", borderColor: "#fca5a5" }}
                     onClick={() => deleteHoliday(h.id)}>刪除</button>
                 </div>
@@ -857,6 +1005,7 @@ export default function CathScheduler() {
   );
 }
 
+// ── Styles ───────────────────────────────────────────────────
 const S = {
   root: {
     minHeight: "100vh", background: "#f1f5f9", color: "#0f172a",
@@ -876,16 +1025,27 @@ const S = {
   logo: { fontSize: 34, lineHeight: 1 },
   title: { fontSize: 20, fontWeight: 800, color: "#0891b2" },
   subtitle: { fontSize: 12, color: "#94a3b8", letterSpacing: 2, textTransform: "uppercase" },
-  headerRight: { display: "flex", alignItems: "center", gap: 10 },
+  headerRight: { display: "flex", alignItems: "center", gap: 8 },
   savingTxt: { fontSize: 13, color: "#0891b2", fontWeight: 600 },
-  userBtn: {
-    display: "flex", alignItems: "center", gap: 6,
-    background: "#f0f9ff", border: "1.5px solid #bae6fd", color: "#0369a1",
-    padding: "7px 16px", borderRadius: 20, fontSize: 14, cursor: "pointer", fontWeight: 600,
-  },
+  userInfo: { display: "flex", alignItems: "center", gap: 6 },
+  userName: { fontWeight: 700, fontSize: 14, color: "#1e293b" },
   adminBadge: {
     fontSize: 10, padding: "1px 6px", borderRadius: 6,
     background: "#fef3c7", color: "#92400e", fontWeight: 700, border: "1px solid #fde68a",
+  },
+  userBtn: {
+    display: "flex", alignItems: "center", gap: 6,
+    background: "#f0f9ff", border: "1.5px solid #bae6fd", color: "#0369a1",
+    padding: "7px 14px", borderRadius: 20, fontSize: 14, cursor: "pointer", fontWeight: 600,
+  },
+  adminLoginBtn: {
+    display: "flex", alignItems: "center", gap: 4,
+    background: "#fef3c7", border: "1.5px solid #fde68a", color: "#92400e",
+    padding: "7px 14px", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 700,
+  },
+  logoutBtn: {
+    padding: "6px 14px", background: "#f1f5f9", border: "1.5px solid #e2e8f0",
+    color: "#64748b", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 600,
   },
   dot: { borderRadius: "50%", display: "inline-block", flexShrink: 0, width: 10, height: 10 },
   nav: {
@@ -1021,6 +1181,22 @@ const S = {
     transition: "background 0.15s",
   },
   pickName: { fontWeight: 700, fontSize: 14, flex: 1 },
+  authInput: {
+    width: "100%", padding: "10px 12px", borderRadius: 8, border: "1.5px solid #cbd5e1",
+    fontSize: 15, outline: "none", boxSizing: "border-box",
+  },
+  authError: {
+    fontSize: 13, color: "#dc2626", background: "#fee2e2",
+    border: "1px solid #fca5a5", borderRadius: 8, padding: "8px 12px",
+  },
+  authHint: {
+    fontSize: 13, color: "#92400e", background: "#fffbeb",
+    border: "1px solid #fde68a", borderRadius: 8, padding: "8px 12px", marginBottom: 12,
+  },
+  authSwitchBtn: {
+    background: "none", border: "none", color: "#0891b2", cursor: "pointer",
+    fontSize: 13, textDecoration: "underline", textAlign: "center",
+  },
   adminTabs: { display: "flex", gap: 4, marginBottom: 16 },
   adminTabBtn: {
     padding: "8px 18px", borderRadius: 20, border: "1.5px solid #e2e8f0",
