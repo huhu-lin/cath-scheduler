@@ -29,12 +29,12 @@ function getStreak(sched, day, memberId, year, month, holidayDays) {
   return s;
 }
 
-// Sort pool: pair bonus > preference_weight > fewer calls
+// Sort pool: pair bonus > fewer calls
 function sortByScore(pool, cnt, selectedIds, pairsMap) {
   return pool.slice().sort((a, b) => {
     const paired = id => (pairsMap[id] || []).some(pid => selectedIds && selectedIds.has(pid));
-    const sa = cnt[a.id] - (a.preference_weight || 0) * 100 - (paired(a.id) ? 500 : 0);
-    const sb = cnt[b.id] - (b.preference_weight || 0) * 100 - (paired(b.id) ? 500 : 0);
+    const sa = cnt[a.id] - (paired(a.id) ? 500 : 0);
+    const sb = cnt[b.id] - (paired(b.id) ? 500 : 0);
     return sa - sb;
   });
 }
@@ -59,9 +59,10 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     (pairsMap[p.member_id_2] = pairsMap[p.member_id_2] || []).push(p.member_id_1);
   }
 
-  // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team
-  // This team is reused for Saturday, Sunday, and the preceding Friday
+  // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team.
+  // Use a dedicated counter so successive weekends rotate to different staff.
   const weekendNonDocTeam = {}; // satDay → [memberId, ...]
+  const wkndCnt = Object.fromEntries(members.map(m => [m.id, 0]));
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue; // only Saturdays
     const sat = d, sun = d + 1;
@@ -74,12 +75,14 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       (sun > days || !sunLv.includes(m.id))
     );
     const sel = new Set(), used = new Set(), team = [];
-    const rads = pick(availBoth.filter(m => m.role === "radiologist"), cnt, r.weekend_radiologist,
+    const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
       availBoth.filter(m => m.role === "radiologist"), sel, pairsMap);
     rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
-    const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
+    const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), wkndCnt, r.weekend_nurse,
       availBoth.filter(m => m.role === "nurse"), sel, pairsMap);
     nurses.forEach(m => { team.push(m.id); });
+    // Update wkndCnt so next weekend favours different staff
+    team.forEach(id => { if (wkndCnt[id] !== undefined) wkndCnt[id]++; });
     weekendNonDocTeam[sat] = team;
   }
 
@@ -264,7 +267,6 @@ async function dbFetchPairs() {
 // ── Constants ───────────────────────────────────────────────
 const DOW_LABELS = ["日","一","二","三","四","五","六"];
 const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
-const PREF_LABELS = ["一般", "偏好", "優先"];
 
 // ── MemberForm ───────────────────────────────────────────────
 function MemberForm({ member, onChange, onSave, onCancel, saving }) {
@@ -287,12 +289,6 @@ function MemberForm({ member, onChange, onSave, onCancel, saving }) {
       <div style={S.formRow}>
         <label style={S.formLabel}>Email</label>
         <input style={S.formInput} type="email" value={member.email || ""} onChange={e => onChange({ ...member, email: e.target.value })} placeholder="管理員帳號用" />
-      </div>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>排班優先</label>
-        <select style={S.formSelect} value={member.preference_weight || 0} onChange={e => onChange({ ...member, preference_weight: parseInt(e.target.value) })}>
-          {PREF_LABELS.map((l, i) => <option key={i} value={i}>{l}</option>)}
-        </select>
       </div>
       <div style={S.formRow}>
         <label style={S.formLabel}>管理員</label>
@@ -513,7 +509,7 @@ export default function CathScheduler() {
       if (m.id) {
         const { error } = await supabase.from("members").update({
           name: m.name, role: m.role, phone: m.phone || "", email: m.email || "",
-          color: m.color, is_admin: !!m.is_admin, preference_weight: m.preference_weight || 0,
+          color: m.color, is_admin: !!m.is_admin,
         }).eq("id", m.id);
         if (error) throw error;
         setMembers(prev => prev.map(x => x.id === m.id ? { ...x, ...m } : x));
@@ -523,7 +519,7 @@ export default function CathScheduler() {
         const maxOrder = members.reduce((max, x) => Math.max(max, x.sort_order || 0), 0);
         const { data, error } = await supabase.from("members").insert({
           id: newId, name: m.name, role: m.role, phone: m.phone || "", email: m.email || "",
-          color: m.color, is_admin: !!m.is_admin, preference_weight: m.preference_weight || 0,
+          color: m.color, is_admin: !!m.is_admin,
           sort_order: maxOrder + 1,
         }).select().single();
         if (error) throw error;
@@ -965,9 +961,6 @@ export default function CathScheduler() {
                     <span style={{ ...S.dot, background: ROLE_COLORS[mbr.role], width: 14, height: 14 }} />
                     <span style={S.statName}>{mbr.name}</span>
                     <span style={{ ...S.roleTag, background: ROLE_COLORS[mbr.role] + "18", color: ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
-                    {(mbr.preference_weight || 0) > 0 && (
-                      <span style={S.prefBadge}>{PREF_LABELS[mbr.preference_weight]}</span>
-                    )}
                   </div>
                   <div style={{ ...S.statCount, color: ROLE_COLORS[mbr.role] }}>{cnt} 次</div>
                 </div>
@@ -998,7 +991,7 @@ export default function CathScheduler() {
                 <div style={S.sectionTitle}>成員名單</div>
                 {!newMember && (
                   <button style={S.btnPrimary} onClick={() => setNewMember({
-                    name: "", role: "nurse", phone: "", email: "", preference_weight: 0,
+                    name: "", role: "nurse", phone: "", email: "",
                     color: DEFAULT_COLORS[members.length % DEFAULT_COLORS.length], is_admin: false,
                   })}>+ 新增成員</button>
                 )}
@@ -1019,7 +1012,6 @@ export default function CathScheduler() {
                       <span style={{ fontWeight: 700, fontSize: 15, flex: 1, minWidth: 60 }}>{m.name}</span>
                       <span style={{ ...S.roleTag, background: ROLE_COLORS[m.role] + "18", color: ROLE_COLORS[m.role] }}>{ROLE_LABELS[m.role]}</span>
                       {m.is_admin && <span style={S.adminBadge}>管理員</span>}
-                      {(m.preference_weight || 0) > 0 && <span style={S.prefBadge}>{PREF_LABELS[m.preference_weight]}</span>}
                       {m.email && <span style={{ fontSize: 12, color: "#94a3b8" }}>✉ {m.email}</span>}
                       {m.phone && <span style={{ fontSize: 13, color: "#64748b" }}>📞 {m.phone}</span>}
                       <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
@@ -1130,19 +1122,6 @@ export default function CathScheduler() {
                     <div style={S.ruleSectionTitle}>🔁 連續值班限制</div>
                     <div style={S.ruleRow}><span style={S.ruleLabel}>最長連續值班</span><span style={S.ruleValue}>{rules.max_consecutive} 天</span></div>
                     <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>＊國定假日與週末不計入連續天數</div>
-                  </div>
-                  <div style={{ ...S.ruleSection, borderBottom: "none", marginBottom: 0, paddingBottom: 0 }}>
-                    <div style={S.ruleSectionTitle}>⭐ 排班優先設定</div>
-                    <div style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>在人員管理中為每位成員設定排班優先等級，優先等級高者在自動排班時會被優先分配。</div>
-                    {members.filter(m => (m.preference_weight || 0) > 0).length === 0
-                      ? <div style={{ fontSize: 13, color: "#94a3b8" }}>目前所有成員均為「一般」優先</div>
-                      : members.filter(m => (m.preference_weight || 0) > 0).map(m => (
-                        <div key={m.id} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
-                          <span style={{ ...S.dot, background: m.color, width: 10, height: 10 }} />
-                          <span style={{ fontWeight: 600, fontSize: 14 }}>{m.name}</span>
-                          <span style={S.prefBadge}>{PREF_LABELS[m.preference_weight]}</span>
-                        </div>
-                      ))}
                   </div>
                 </div>
               )}
@@ -1271,7 +1250,6 @@ const S = {
   userInfo: { display: "flex", alignItems: "center", gap: 6 },
   userName: { fontWeight: 700, fontSize: 14, color: "#1e293b" },
   adminBadge: { fontSize: 10, padding: "1px 6px", borderRadius: 6, background: "#fef3c7", color: "#92400e", fontWeight: 700, border: "1px solid #fde68a" },
-  prefBadge: { fontSize: 10, padding: "1px 6px", borderRadius: 6, background: "#f0fdf4", color: "#16a34a", fontWeight: 700, border: "1px solid #86efac" },
   userBtn: { display: "flex", alignItems: "center", gap: 6, background: "#f0f9ff", border: "1.5px solid #bae6fd", color: "#0369a1", padding: "7px 14px", borderRadius: 20, fontSize: 14, cursor: "pointer", fontWeight: 600 },
   adminLoginBtn: { display: "flex", alignItems: "center", gap: 4, background: "#fef3c7", border: "1.5px solid #fde68a", color: "#92400e", padding: "7px 14px", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 700 },
   logoutBtn: { padding: "6px 14px", background: "#f1f5f9", border: "1.5px solid #e2e8f0", color: "#64748b", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 600 },
