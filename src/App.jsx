@@ -91,7 +91,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     weekendNonDocTeam[sat] = team;
   }
 
-  // Pre-seed cnt with expected weekend shifts so weekday selection deprioritises
+  // Pre-seed cnt with weekend shifts so weekday selection deprioritises
   // staff who already have weekend duties this month.
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue;
@@ -101,13 +101,24 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     team.forEach(id => { if (cnt[id] !== undefined) cnt[id] += daysWorked; });
   }
 
+  // Pre-seed cnt with all locked-day manual assignments so that auto-assigned
+  // days (which may come before the locked day in the loop) correctly
+  // deprioritise staff who already have manual shifts later in the month.
+  if (lockedDays) {
+    for (let d = 1; d <= days; d++) {
+      if (!lockedDays.has(d)) continue;
+      const ids = (manualSchedule && manualSchedule[d]) ? manualSchedule[d] : (existingSched[d] || []);
+      ids.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+    }
+  }
+
   for (let d = 1; d <= days; d++) {
     if (lockedDays && lockedDays.has(d)) {
       const manualIds = (manualSchedule && manualSchedule[d]) ? [...manualSchedule[d]] : (existingSched[d] || []);
       // On holidays, keep only the manual assignments — no auto-fill
       if (holidayDays && holidayDays.has(d)) {
         sched[d] = manualIds;
-        manualIds.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+        // manual members already pre-seeded; no cnt increment needed
         continue;
       }
       // Keep manually-assigned members; auto-fill the remaining slots
@@ -156,7 +167,8 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         }
       }
       sched[d] = result;
-      result.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+      // Manual members were pre-seeded; only count the auto-filled additions
+      result.filter(id => !manualIds.includes(id)).forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
       continue;
     }
     if (holidayDays && holidayDays.has(d)) {
@@ -570,6 +582,7 @@ export default function CathScheduler() {
   // ── Doctor quick-fill ────────────────────────────────────────
   const [doctorFillOpen, setDoctorFillOpen] = useState(false);
   const [doctorFillDraft, setDoctorFillDraft] = useState({});
+  const [leaveSelectedDay, setLeaveSelectedDay] = useState(null);
 
   function openDoctorFill() {
     const doctorIds = new Set(members.filter(m => m.role === "doctor").map(m => m.id));
@@ -1099,7 +1112,9 @@ export default function CathScheduler() {
       {/* ── Leave ── */}
       {view === "leave" && (
         <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
-          <div style={S.leaveNote}>{currentUser ? `身份：${currentUser.name}　點擊自己的名字來預假 / 取消` : "⬆ 請先點右上角「選擇身份」，再操作預假"}</div>
+          <div style={S.leaveNote}>
+            {isAdmin ? "管理員模式：可幫任何人預假／取消" : currentUser ? `身份：${currentUser.name}　點擊自己的名字來預假 / 取消` : "⬆ 請先點右上角「選擇身份」，再操作預假"}
+          </div>
           <div style={S.calGrid}>
             {DOW_LABELS.map((d, i) => (
               <div key={d} style={{ ...S.dowHeader, color: i === 0 ? "#dc2626" : i === 6 ? "#2563eb" : "#64748b" }}>{d}</div>
@@ -1111,28 +1126,73 @@ export default function CathScheduler() {
               const dow = getDow(year, month, d);
               const leaves = leaveMap[d] || [];
               const holName = holidayMap[d];
+              const isSelDay = leaveSelectedDay === d;
               return (
-                <div key={d} style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), minHeight: isMobile ? 72 : 88, ...(isMobile ? { padding: "4px 3px" } : {}) }}>
+                <div key={d}
+                  style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), ...(isSelDay ? S.cellSelected : {}), minHeight: isMobile ? 60 : 88, ...(isMobile ? { padding: "4px 3px", cursor: "pointer" } : {}) }}
+                  onClick={() => isMobile && setLeaveSelectedDay(isSelDay ? null : d)}>
                   <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
                   {!isMobile && <div style={S.cellDow}>{DOW_LABELS[dow]}</div>}
                   {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
-                  <div style={S.cellMembers}>
-                    {members.map(mbr => {
-                      const onLeave = leaves.includes(mbr.id);
-                      const isMe = currentUser?.id === mbr.id;
-                      return (
-                        <span key={mbr.id} onClick={() => isMe && toggleLeave(d, mbr.id)}
-                          title={`${mbr.name}：${isMe ? "點擊預假/取消" : "只能操作自己的假"}`}
-                          style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: onLeave ? "#fee2e2" : "#f1f5f9", color: onLeave ? "#dc2626" : isMe ? "#334155" : "#94a3b8", border: `1.5px solid ${onLeave ? "#fca5a5" : isMe ? "#cbd5e1" : "#e2e8f0"}`, cursor: isMe ? "pointer" : "default", opacity: isMe || !currentUser ? 1 : 0.45, fontWeight: isMe ? 700 : 400 }}>
-                          {onLeave ? "🚫" : ""}{isMobile ? mbr.name.slice(-2) : mbr.name}
-                        </span>
-                      );
-                    })}
-                  </div>
+                  {isMobile ? (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 2, marginTop: 2 }}>
+                      {leaves.map(id => {
+                        const mbr = getMember(id);
+                        if (!mbr) return null;
+                        return <span key={id} style={{ ...S.dot, width: 7, height: 7, background: ROLE_COLORS[mbr.role] }} title={mbr.name} />;
+                      })}
+                    </div>
+                  ) : (
+                    <div style={S.cellMembers}>
+                      {members.map(mbr => {
+                        const onLeave = leaves.includes(mbr.id);
+                        const canEdit = isAdmin || currentUser?.id === mbr.id;
+                        return (
+                          <span key={mbr.id} onClick={() => canEdit && toggleLeave(d, mbr.id)}
+                            title={`${mbr.name}：${canEdit ? "點擊預假/取消" : "無權限"}`}
+                            style={{ ...S.chip, background: onLeave ? "#fee2e2" : "#f1f5f9", color: onLeave ? "#dc2626" : canEdit ? "#334155" : "#94a3b8", border: `1.5px solid ${onLeave ? "#fca5a5" : canEdit ? "#cbd5e1" : "#e2e8f0"}`, cursor: canEdit ? "pointer" : "default", opacity: canEdit || !currentUser ? 1 : 0.45, fontWeight: canEdit ? 700 : 400 }}>
+                            {onLeave ? "🚫 " : ""}{mbr.name}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
+          {/* Mobile leave day panel */}
+          {isMobile && leaveSelectedDay && (
+            <div style={{ ...S.panel, marginTop: 10 }}>
+              <div style={S.panelHeader}>
+                <div style={S.panelTitle}>{leaveSelectedDay} 日　預假</div>
+                <button style={S.panelClose} onClick={() => setLeaveSelectedDay(null)}>✕</button>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {members.map(mbr => {
+                  const onLeave = (leaveMap[leaveSelectedDay] || []).includes(mbr.id);
+                  const canEdit = isAdmin || currentUser?.id === mbr.id;
+                  return (
+                    <div key={mbr.id} style={{ ...S.oncallCard, borderLeftColor: ROLE_COLORS[mbr.role], opacity: canEdit ? 1 : 0.5 }}>
+                      <div style={S.oncallCardLeft}>
+                        <span style={{ ...S.dot, background: ROLE_COLORS[mbr.role], width: 10, height: 10 }} />
+                        <span style={{ fontWeight: 700, fontSize: 14 }}>{mbr.name}</span>
+                        <span style={{ ...S.roleTag, background: ROLE_COLORS[mbr.role] + "18", color: ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
+                        {onLeave && <span style={{ fontSize: 13, color: "#dc2626", fontWeight: 700 }}>🚫 請假中</span>}
+                      </div>
+                      {canEdit && (
+                        <button
+                          style={{ padding: "6px 14px", borderRadius: 16, border: `1.5px solid ${onLeave ? "#fca5a5" : "#86efac"}`, background: onLeave ? "#fee2e2" : "#f0fdf4", color: onLeave ? "#dc2626" : "#16a34a", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+                          onClick={() => toggleLeave(leaveSelectedDay, mbr.id)}>
+                          {onLeave ? "取消請假" : "請假"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
