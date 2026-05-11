@@ -357,6 +357,13 @@ function MemberForm({ member, onChange, onSave, onCancel, saving }) {
 // ── Main component ───────────────────────────────────────────
 export default function CathScheduler() {
   const today = new Date();
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 640);
+  useEffect(() => {
+    const fn = () => setIsMobile(window.innerWidth < 640);
+    window.addEventListener("resize", fn);
+    return () => window.removeEventListener("resize", fn);
+  }, []);
+
   const [year, setYear]     = useState(today.getFullYear());
   const [month, setMonth]   = useState(today.getMonth());
   const [members, setMembers]       = useState([]);
@@ -767,12 +774,12 @@ export default function CathScheduler() {
       {toast && <div style={{ ...S.toast, background: toast.type === "err" ? "#dc2626" : "#0891b2" }}>{toast.msg}</div>}
 
       {/* Header */}
-      <header style={S.header}>
+      <header style={{ ...S.header, padding: isMobile ? "10px 12px" : "14px 20px" }}>
         <div style={S.headerLeft}>
-          <span style={S.logo}>🫀</span>
+          <span style={{ ...S.logo, fontSize: isMobile ? 26 : 34 }}>🫀</span>
           <div>
-            <div style={S.title}>心導管室 On-Call</div>
-            <div style={S.subtitle}>排班系統</div>
+            <div style={{ ...S.title, fontSize: isMobile ? 16 : 20 }}>心導管室 On-Call</div>
+            {!isMobile && <div style={S.subtitle}>排班系統</div>}
           </div>
         </div>
         <div style={S.headerRight}>
@@ -869,14 +876,23 @@ export default function CathScheduler() {
         }}>›</button>
         {view === "calendar" && isAdmin && (
           <>
-            <button style={S.genBtn} onClick={() => handleAutoGenerate(false)} disabled={saving || loading}>⚡ 自動排班</button>
-            <button style={S.regenBtn} onClick={() => handleAutoGenerate(true)} disabled={saving || loading} title="重新產生一份不同的班表">🔀 重新排班</button>
-            <button style={S.docFillBtn} onClick={openDoctorFill} disabled={saving || loading}>👨‍⚕️ 填醫師班</button>
-            <button style={{ ...S.editToggleBtn, ...(editMode ? S.editToggleBtnActive : {}) }}
-              onClick={() => { setEditMode(e => !e); setSelectedDay(null); }}>
-              ✏️ {editMode ? "完成編輯" : "手動調整"}
+            <button style={S.genBtn} onClick={() => handleAutoGenerate(false)} disabled={saving || loading} title="自動排班">
+              {isMobile ? "⚡" : "⚡ 自動排班"}
             </button>
-            <button style={S.clearBtn} onClick={handleClearSchedule} disabled={saving || loading}>🗑️ 清除</button>
+            <button style={S.regenBtn} onClick={() => handleAutoGenerate(true)} disabled={saving || loading} title="重新產生一份不同的班表">
+              {isMobile ? "🔀" : "🔀 重新排班"}
+            </button>
+            <button style={S.docFillBtn} onClick={openDoctorFill} disabled={saving || loading} title="填醫師班">
+              {isMobile ? "👨‍⚕️" : "👨‍⚕️ 填醫師班"}
+            </button>
+            <button style={{ ...S.editToggleBtn, ...(editMode ? S.editToggleBtnActive : {}) }}
+              onClick={() => { setEditMode(e => !e); setSelectedDay(null); }}
+              title={editMode ? "完成編輯" : "手動調整"}>
+              {isMobile ? (editMode ? "✓" : "✏️") : `✏️ ${editMode ? "完成編輯" : "手動調整"}`}
+            </button>
+            <button style={S.clearBtn} onClick={handleClearSchedule} disabled={saving || loading} title="清除">
+              {isMobile ? "🗑️" : "🗑️ 清除"}
+            </button>
           </>
         )}
         <button style={S.reloadBtn} onClick={loadAll} disabled={loading}>↺</button>
@@ -889,7 +905,7 @@ export default function CathScheduler() {
 
       {/* ── Calendar ── */}
       {view === "calendar" && (
-        <div style={S.content}>
+        <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.calGrid}>
             {DOW_LABELS.map((d, i) => (
               <div key={d} style={{ ...S.dowHeader, color: i === 0 ? "#dc2626" : i === 6 ? "#2563eb" : "#64748b" }}>{d}</div>
@@ -908,25 +924,25 @@ export default function CathScheduler() {
               const holName = holidayMap[d];
               return (
                 <div key={d}
-                  style={{ ...S.cell, ...(wg ? S.cellWG : {}), ...(fri ? S.cellFri : {}), ...(holName ? S.cellHoliday : {}), ...(isToday(d) ? S.cellToday : {}), ...(isSelected && !editMode ? S.cellSelected : {}), ...(editMode ? S.cellEditMode : {}) }}
+                  style={{ ...S.cell, ...(wg ? S.cellWG : {}), ...(fri ? S.cellFri : {}), ...(holName ? S.cellHoliday : {}), ...(isToday(d) ? S.cellToday : {}), ...(isSelected && !editMode ? S.cellSelected : {}), ...(editMode ? S.cellEditMode : {}), ...(isMobile ? { minHeight: 58, padding: "4px 3px" } : {}) }}
                   onClick={() => { if (!editMode) setSelectedDay(isSelected ? null : d); }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                    <div style={{ ...S.cellDay, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
+                    <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
                     {isLocked && <span title="手動排定" style={S.lockIcon}>🔒</span>}
                   </div>
-                  <div style={S.cellDow}>{DOW_LABELS[dow]}{wg ? " 🌙" : fri ? " ★" : ""}</div>
-                  {holName && <div style={S.holidayLabel}>{holName}</div>}
+                  {!isMobile && <div style={S.cellDow}>{DOW_LABELS[dow]}{wg ? " 🌙" : fri ? " ★" : ""}</div>}
+                  {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
                   <div style={S.cellMembers}>
                     {[...assigned].sort((a, b) => (ROLE_ORDER[getMember(a)?.role] ?? 9) - (ROLE_ORDER[getMember(b)?.role] ?? 9)).map(id => {
                       const mbr = getMember(id);
                       if (!mbr) return null;
                       return (
                         <span key={id}
-                          style={{ ...S.chip, background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}) }}
+                          style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}) }}
                           onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
-                          title={editMode && isAdmin ? "點擊移除" : undefined}>
+                          title={editMode && isAdmin ? "點擊移除" : mbr.name}>
                           {editMode && isAdmin && <span style={S.chipRemove}>✕ </span>}
-                          {mbr.name}
+                          {isMobile ? mbr.name.slice(0, 1) : mbr.name}
                         </span>
                       );
                     })}
@@ -1076,7 +1092,7 @@ export default function CathScheduler() {
 
       {/* ── Leave ── */}
       {view === "leave" && (
-        <div style={S.content}>
+        <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.leaveNote}>{currentUser ? `身份：${currentUser.name}　點擊自己的名字來預假 / 取消` : "⬆ 請先點右上角「選擇身份」，再操作預假"}</div>
           <div style={S.calGrid}>
             {DOW_LABELS.map((d, i) => (
@@ -1090,19 +1106,19 @@ export default function CathScheduler() {
               const leaves = leaveMap[d] || [];
               const holName = holidayMap[d];
               return (
-                <div key={d} style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), minHeight: 88 }}>
-                  <div style={{ ...S.cellDay, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
-                  <div style={S.cellDow}>{DOW_LABELS[dow]}</div>
-                  {holName && <div style={S.holidayLabel}>{holName}</div>}
+                <div key={d} style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), minHeight: isMobile ? 72 : 88, ...(isMobile ? { padding: "4px 3px" } : {}) }}>
+                  <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
+                  {!isMobile && <div style={S.cellDow}>{DOW_LABELS[dow]}</div>}
+                  {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
                   <div style={S.cellMembers}>
                     {members.map(mbr => {
                       const onLeave = leaves.includes(mbr.id);
                       const isMe = currentUser?.id === mbr.id;
                       return (
                         <span key={mbr.id} onClick={() => isMe && toggleLeave(d, mbr.id)}
-                          title={isMe ? "點擊預假/取消" : "只能操作自己的假"}
-                          style={{ ...S.chip, background: onLeave ? "#fee2e2" : "#f1f5f9", color: onLeave ? "#dc2626" : isMe ? "#334155" : "#94a3b8", border: `1.5px solid ${onLeave ? "#fca5a5" : isMe ? "#cbd5e1" : "#e2e8f0"}`, cursor: isMe ? "pointer" : "default", opacity: isMe || !currentUser ? 1 : 0.45, fontWeight: isMe ? 700 : 400 }}>
-                          {onLeave ? "🚫 " : ""}{mbr.name}
+                          title={`${mbr.name}：${isMe ? "點擊預假/取消" : "只能操作自己的假"}`}
+                          style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: onLeave ? "#fee2e2" : "#f1f5f9", color: onLeave ? "#dc2626" : isMe ? "#334155" : "#94a3b8", border: `1.5px solid ${onLeave ? "#fca5a5" : isMe ? "#cbd5e1" : "#e2e8f0"}`, cursor: isMe ? "pointer" : "default", opacity: isMe || !currentUser ? 1 : 0.45, fontWeight: isMe ? 700 : 400 }}>
+                          {onLeave ? "🚫" : ""}{isMobile ? mbr.name.slice(0, 1) : mbr.name}
                         </span>
                       );
                     })}
@@ -1116,7 +1132,7 @@ export default function CathScheduler() {
 
       {/* ── Stats ── */}
       {view === "stats" && (
-        <div style={S.content}>
+        <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.statsGrid}>
             {members.map(mbr => {
               const cnt = callCount[mbr.id] || 0;
@@ -1143,7 +1159,7 @@ export default function CathScheduler() {
 
       {/* ── Admin ── */}
       {view === "admin" && isAdmin && (
-        <div style={S.content}>
+        <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.adminTabs}>
             {[["members","👥 人員管理"],["rules","📋 排班規則"],["pairs","🤝 偏好配對"],["holidays","🎌 國定假日"]].map(([t, l]) => (
               <button key={t} style={{ ...S.adminTabBtn, ...(adminTab === t ? S.adminTabActive : {}) }}
@@ -1421,7 +1437,7 @@ const S = {
   loadingBar: { height: 3, background: "#e0f2fe", overflow: "hidden" },
   loadingFill: { height: "100%", width: "60%", background: "#0891b2" },
   editBanner: { background: "#fffbeb", borderBottom: "1px solid #fcd34d", padding: "8px 16px", fontSize: 13, color: "#92400e", fontWeight: 600 },
-  content: { padding: "8px 10px 48px" },
+  content: { padding: "8px 10px 48px" }, // overridden inline on mobile
   calGrid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 3 },
   dowHeader: { textAlign: "center", fontSize: 13, padding: "6px 0", fontWeight: 700 },
   emptyCell: { minHeight: 80 },
@@ -1476,7 +1492,7 @@ const S = {
   authError: { fontSize: 13, color: "#dc2626", background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 8, padding: "8px 12px" },
   authHint: { fontSize: 13, color: "#92400e", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 12px", marginBottom: 12 },
   authSwitchBtn: { background: "none", border: "none", color: "#0891b2", cursor: "pointer", fontSize: 13, textDecoration: "underline", textAlign: "center" },
-  adminTabs: { display: "flex", gap: 4, marginBottom: 16 },
+  adminTabs: { display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" },
   adminTabBtn: { padding: "8px 18px", borderRadius: 20, border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#64748b", cursor: "pointer", fontSize: 14, fontWeight: 600 },
   adminTabActive: { background: "#e0f2fe", color: "#0891b2", borderColor: "#bae6fd" },
   adminSection: { background: "#fff", borderRadius: 12, padding: 16, border: "1.5px solid #e2e8f0" },
