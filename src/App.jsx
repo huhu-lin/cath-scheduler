@@ -30,23 +30,27 @@ function getStreak(sched, day, memberId, year, month, holidayDays) {
   return s;
 }
 
-// Sort pool: pair bonus > fewer calls
-function sortByScore(pool, cnt, selectedIds, pairsMap) {
-  return pool.slice().sort((a, b) => {
-    const paired = id => (pairsMap[id] || []).some(pid => selectedIds && selectedIds.has(pid));
-    const sa = cnt[a.id] - (paired(a.id) ? 500 : 0);
-    const sb = cnt[b.id] - (paired(b.id) ? 500 : 0);
-    return sa - sb;
-  });
+// Sort pool: balance (soft cap at floor(avg)+1) > pair bonus > fewer calls
+// useRandom: add small noise so equal-score members get shuffled differently each run
+function sortByScore(pool, cnt, selectedIds, pairsMap, useRandom) {
+  const poolAvg = pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0;
+  const cap = Math.floor(poolAvg) + 1;
+  const scores = new Map(pool.map(m => {
+    const paired = (pairsMap[m.id] || []).some(pid => selectedIds && selectedIds.has(pid));
+    const overCap = (cnt[m.id] || 0) >= cap ? 2000 : 0;
+    const noise = useRandom ? Math.random() * 0.9 : 0;
+    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + overCap + noise];
+  }));
+  return pool.slice().sort((a, b) => scores.get(a.id) - scores.get(b.id));
 }
 
-// Pick N from pool (with pair boost); fall back to fallback pool if not enough
-function pick(pool, cnt, n, fallback, selectedIds, pairsMap) {
-  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap);
-  return sorted.length >= n ? sorted.slice(0, n) : sortByScore(fallback, cnt, selectedIds, pairsMap).slice(0, n);
+// Pick N from pool; fall back to fallback pool if not enough
+function pick(pool, cnt, n, fallback, selectedIds, pairsMap, useRandom) {
+  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, useRandom);
+  return sorted.length >= n ? sorted.slice(0, n) : sortByScore(fallback, cnt, selectedIds, pairsMap, useRandom).slice(0, n);
 }
 
-function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule) {
+function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom) {
   const r = rules || DEFAULT_RULES;
   const days = getDaysInMonth(year, month);
   const sched = {};
@@ -77,10 +81,10 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     );
     const sel = new Set(), used = new Set(), team = [];
     const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
-      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap);
+      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom);
     rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
     const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), wkndCnt, r.weekend_nurse,
-      availBoth.filter(m => m.role === "nurse"), sel, pairsMap);
+      availBoth.filter(m => m.role === "nurse"), sel, pairsMap, useRandom);
     nurses.forEach(m => { team.push(m.id); });
     // Update wkndCnt so next weekend favours different staff
     team.forEach(id => { if (wkndCnt[id] !== undefined) wkndCnt[id]++; });
@@ -118,7 +122,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const needDoc = Math.max(0, r.weekend_doctor - numDoc);
         if (needDoc > 0) {
           const pool = avail.filter(m => m.role === "doctor");
-          pick(pool, cnt, needDoc, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool, cnt, needDoc, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (preTeam.length > 0) {
           preTeam.forEach(id => { result.push(id); usedIds.add(id); sel.add(id); });
@@ -127,11 +131,11 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
           const needNurse = Math.max(0, r.weekend_nurse - numNurse);
           if (needRad > 0) {
             const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-            pick(pool, cnt, needRad, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+            pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
           }
           if (needNurse > 0) {
             const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-            pick(pool, cnt, needNurse, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+            pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
           }
         }
       } else {
@@ -139,21 +143,21 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const needDoc = Math.max(0, r.weekday_doctor - numDoc);
         if (needDoc > 0) {
           const pool = avail.filter(m => m.role === "doctor");
-          pick(pool.filter(eligible), cnt, needDoc, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, needDoc, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (numRad === 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (numNurse === 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
         const remaining = r.weekday_rad_nurse - currentRN;
         if (remaining > 0) {
           const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap).forEach(m => { result.push(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); sel.add(m.id); });
         }
       }
       sched[d] = result;
@@ -174,7 +178,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     if (isWeekend(dow)) {
       // Doctors: weekend rule
       pick(avail.filter(m => m.role === "doctor"), cnt, r.weekend_doctor,
-        avail.filter(m => m.role === "doctor"), sel, pairsMap)
+        avail.filter(m => m.role === "doctor"), sel, pairsMap, useRandom)
         .forEach(m => { result.push(m.id); sel.add(m.id); });
 
       // Non-doctors: use the pre-computed shared team (same on Sat and Sun)
@@ -187,10 +191,10 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         // Fallback: generate independently (e.g. sat was a holiday)
         const used = new Set(result);
         pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
-          avail.filter(m => m.role === "radiologist"), sel, pairsMap)
+          avail.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom)
           .forEach(m => { result.push(m.id); sel.add(m.id); used.add(m.id); });
         pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
-          avail.filter(m => m.role === "nurse"), sel, pairsMap)
+          avail.filter(m => m.role === "nurse"), sel, pairsMap, useRandom)
           .forEach(m => { result.push(m.id); sel.add(m.id); });
       }
 
@@ -200,7 +204,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
 
       // Doctors: weekday rule
       const docPool = avail.filter(m => m.role === "doctor");
-      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap)
+      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap, useRandom)
         .forEach(m => { result.push(m.id); sel.add(m.id); });
 
       // Non-doctors: use the following weekend's team (Sat = d+1)
@@ -214,17 +218,17 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         (m.role === "radiologist" || m.role === "nurse") &&
         !result.includes(m.id) && eligible(m)
       );
-      pick(extraPool, cnt, 1, extraPool, sel, pairsMap)
+      pick(extraPool, cnt, 1, extraPool, sel, pairsMap, useRandom)
         .forEach(m => { result.push(m.id); sel.add(m.id); });
 
       // Guarantee min 1 rad and 1 nurse on Friday
       if (!result.some(id => getMember(id)?.role === "radiologist")) {
         const fb = avail.filter(m => m.role === "radiologist" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap).forEach(m => { result.push(m.id); sel.add(m.id); });
+        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); sel.add(m.id); });
       }
       if (!result.some(id => getMember(id)?.role === "nurse")) {
         const fb = avail.filter(m => m.role === "nurse" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap).forEach(m => { result.push(m.id); sel.add(m.id); });
+        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); sel.add(m.id); });
       }
 
       // If no weekend team (Friday at month-end), fill with weekday rad/nurse slots
@@ -237,7 +241,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const remaining = r.weekday_rad_nurse - filled;
         if (remaining > 0) {
           const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id) && eligible(m));
-          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap)
+          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap, useRandom)
             .forEach(m => { result.push(m.id); sel.add(m.id); });
         }
       }
@@ -249,15 +253,15 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const used = new Set();
 
       const docPool = avail.filter(m => m.role === "doctor");
-      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap)
+      pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap, useRandom)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
-      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap)
+      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, useRandom)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const nursePool = avail.filter(m => m.role === "nurse" && !used.has(m.id));
-      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap)
+      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap, useRandom)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const filled = result.filter(id => {
@@ -267,7 +271,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap)
+        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, useRandom)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
     }
@@ -567,12 +571,73 @@ export default function CathScheduler() {
     setSaving(false);
   }
 
-  function handleAutoGenerate() {
+  function handleAutoGenerate(useRandom = false) {
     const holidayDays = new Set(
       holidays.filter(h => h.year === year && h.month === month + 1).map(h => h.day)
     );
-    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules, pairs, manualSchedule);
+    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom);
     saveFullSchedule(gen);
+  }
+
+  // ── Doctor quick-fill ────────────────────────────────────────
+  const [doctorFillOpen, setDoctorFillOpen] = useState(false);
+  const [doctorFillDraft, setDoctorFillDraft] = useState({});
+
+  function openDoctorFill() {
+    const doctorIds = new Set(members.filter(m => m.role === "doctor").map(m => m.id));
+    const draft = {};
+    for (let d = 1; d <= getDaysInMonth(year, month); d++) {
+      const docInDay = (schedule[d] || []).find(id => doctorIds.has(id));
+      draft[d] = docInDay || "";
+    }
+    setDoctorFillDraft(draft);
+    setDoctorFillOpen(true);
+  }
+
+  async function saveDoctorFill() {
+    setSaving(true);
+    try {
+      const doctorIds = [...members.filter(m => m.role === "doctor").map(m => m.id)];
+      if (doctorIds.length > 0) {
+        const { error } = await supabase.from("schedules").delete()
+          .eq("year", year).eq("month", month).in("member_id", doctorIds);
+        if (error) throw error;
+      }
+      const rows = Object.entries(doctorFillDraft)
+        .filter(([, id]) => id)
+        .map(([day, member_id]) => ({ year, month, day: parseInt(day), member_id, manually_set: true }));
+      if (rows.length > 0) {
+        const { error } = await supabase.from("schedules").insert(rows);
+        if (error) throw error;
+      }
+      // Update local state
+      const docSet = new Set(doctorIds);
+      const newSched = {};
+      const newManual = {};
+      const newLocked = new Set();
+      for (let d = 1; d <= getDaysInMonth(year, month); d++) {
+        newSched[d] = (schedule[d] || []).filter(id => !docSet.has(id));
+        newManual[d] = (manualSchedule[d] || []).filter(id => !docSet.has(id));
+      }
+      for (const [day, memberId] of Object.entries(doctorFillDraft)) {
+        const d = parseInt(day);
+        if (memberId) {
+          newSched[d] = [...(newSched[d] || []), memberId];
+          newManual[d] = [...(newManual[d] || []), memberId];
+        }
+      }
+      for (let d = 1; d <= getDaysInMonth(year, month); d++) {
+        if ((newManual[d] || []).length > 0) newLocked.add(d);
+      }
+      // Preserve locks from non-doctor manual entries
+      lockedDays.forEach(d => { if ((manualSchedule[d] || []).some(id => !docSet.has(id))) newLocked.add(d); });
+      setSchedule(newSched);
+      setManualSchedule(newManual);
+      setLockedDays(newLocked);
+      setDoctorFillOpen(false);
+      notify("✅ 醫師班表已儲存");
+    } catch (e) { notify("❌ 儲存失敗：" + e.message, "err"); }
+    setSaving(false);
   }
 
   async function handleClearSchedule() {
@@ -829,7 +894,9 @@ export default function CathScheduler() {
         }}>›</button>
         {view === "calendar" && isAdmin && (
           <>
-            <button style={S.genBtn} onClick={handleAutoGenerate} disabled={saving || loading}>⚡ 自動排班</button>
+            <button style={S.genBtn} onClick={() => handleAutoGenerate(false)} disabled={saving || loading}>⚡ 自動排班</button>
+            <button style={S.regenBtn} onClick={() => handleAutoGenerate(true)} disabled={saving || loading} title="重新產生一份不同的班表">🔀 重新排班</button>
+            <button style={S.docFillBtn} onClick={openDoctorFill} disabled={saving || loading}>👨‍⚕️ 填醫師班</button>
             <button style={{ ...S.editToggleBtn, ...(editMode ? S.editToggleBtnActive : {}) }}
               onClick={() => { setEditMode(e => !e); setSelectedDay(null); }}>
               ✏️ {editMode ? "完成編輯" : "手動調整"}
@@ -990,6 +1057,43 @@ export default function CathScheduler() {
                   </button>
                 );
               })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Doctor quick-fill modal ── */}
+      {doctorFillOpen && isAdmin && (
+        <div style={S.modalOverlay} onClick={() => setDoctorFillOpen(false)}>
+          <div style={{ ...S.modalBox, maxWidth: 480, width: "94vw", maxHeight: "85vh", overflowY: "auto" }} onClick={e => e.stopPropagation()}>
+            <div style={S.modalHeader}>
+              <span style={S.modalTitle}>👨‍⚕️ 醫師快速填班 — {year}年{month + 1}月</span>
+              <button style={S.modalClose} onClick={() => setDoctorFillOpen(false)}>✕</button>
+            </div>
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 12 }}>逐日選擇值班醫師，儲存後醫師班次將鎖定（不受自動排班影響）。</div>
+            {Array.from({ length: getDaysInMonth(year, month) }, (_, i) => i + 1).map(d => {
+              const dow = getDow(year, month, d);
+              const holName = holidays.find(h => h.year === year && h.month === month + 1 && h.day === d)?.name;
+              const doctors = members.filter(m => m.role === "doctor");
+              return (
+                <div key={d} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", borderBottom: "1px solid #f1f5f9" }}>
+                  <span style={{ minWidth: 70, fontWeight: 600, fontSize: 13, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>
+                    {month + 1}/{d} {DOW_LABELS[dow]}
+                  </span>
+                  {holName && <span style={{ fontSize: 11, color: "#dc2626", flexShrink: 0 }}>{holName}</span>}
+                  <select
+                    style={{ flex: 1, padding: "4px 8px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, background: doctorFillDraft[d] ? "#f0fdf4" : "#fff" }}
+                    value={doctorFillDraft[d] || ""}
+                    onChange={e => setDoctorFillDraft(prev => ({ ...prev, [d]: e.target.value }))}>
+                    <option value="">— 未排 —</option>
+                    {doctors.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                  </select>
+                </div>
+              );
+            })}
+            <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+              <button style={S.btnPrimary} onClick={saveDoctorFill} disabled={saving}>💾 儲存</button>
+              <button style={{ ...S.btnPrimary, background: "#64748b" }} onClick={() => setDoctorFillOpen(false)}>取消</button>
             </div>
           </div>
         </div>
@@ -1352,6 +1456,8 @@ const S = {
   editToggleBtn: { padding: "8px 16px", background: "#fff", color: "#92400e", border: "1.5px solid #fcd34d", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
   editToggleBtnActive: { background: "#fef3c7", color: "#92400e", borderColor: "#f59e0b", boxShadow: "0 2px 8px #f59e0b30" },
   clearBtn: { padding: "8px 14px", background: "#fff", color: "#dc2626", border: "1.5px solid #fca5a5", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
+  regenBtn: { padding: "8px 14px", background: "#fff", color: "#7c3aed", border: "1.5px solid #c4b5fd", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
+  docFillBtn: { padding: "8px 14px", background: "#fff", color: "#16a34a", border: "1.5px solid #86efac", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
   reloadBtn: { width: 34, height: 34, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
   loadingBar: { height: 3, background: "#e0f2fe", overflow: "hidden" },
   loadingFill: { height: "100%", width: "60%", background: "#0891b2" },
