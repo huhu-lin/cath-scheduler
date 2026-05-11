@@ -133,21 +133,16 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const numNurse = manualIds.filter(id => getMember(id)?.role === "nurse").length;
 
       if (isWeekend(getDow(year, month, d))) {
-        const satDay = getDow(year, month, d) === 6 ? d : d - 1;
-        const preTeam = (weekendNonDocTeam[satDay] || []).filter(id => !usedIds.has(id) && !lv.includes(id));
-        if (preTeam.length > 0) {
-          preTeam.forEach(id => { result.push(id); usedIds.add(id); sel.add(id); });
-        } else {
-          const needRad   = Math.max(0, r.weekend_radiologist - numRad);
-          const needNurse = Math.max(0, r.weekend_nurse - numNurse);
-          if (needRad > 0) {
-            const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-            pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-          }
-          if (needNurse > 0) {
-            const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-            pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-          }
+        // Respect manual assignments; only fill up to quota
+        const needRad   = Math.max(0, r.weekend_radiologist - numRad);
+        const needNurse = Math.max(0, r.weekend_nurse - numNurse);
+        if (needRad > 0) {
+          const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
+          pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+        }
+        if (needNurse > 0) {
+          const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
+          pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
       } else {
         // Weekday (Mon–Fri): fill to weekday quotas
