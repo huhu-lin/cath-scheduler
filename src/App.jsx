@@ -95,12 +95,21 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
   // Pre-seed cnt with weekend shifts so weekday selection deprioritises
   // staff who already have weekend duties this month.
   // Skip locked weekends — those use manualSchedule, not weekendNonDocTeam.
+  // Also include the preceding Friday if it's a normal working day — the Friday
+  // logic uses the same weekend team, so their total "block" is Fri+Sat+Sun.
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue;
     if (lockedDays && lockedDays.has(d)) continue;
     const team = weekendNonDocTeam[d] || [];
     const sun = d + 1;
-    const daysWorked = sun <= days ? 2 : 1; // Sat + Sun (or just Sat at month-end)
+    let daysWorked = sun <= days ? 2 : 1; // Sat + Sun (or just Sat at month-end)
+    // Count the preceding Friday if it's a normal non-holiday, non-locked weekday
+    const fri = d - 1;
+    if (fri >= 1 && !isWeekend(getDow(year, month, fri)) &&
+        !(lockedDays && lockedDays.has(fri)) &&
+        !(holidayDays && holidayDays.has(fri))) {
+      daysWorked += 1;
+    }
     team.forEach(id => { if (cnt[id] !== undefined) cnt[id] += daysWorked; });
   }
 
@@ -299,11 +308,17 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
 
     sched[d] = result;
     if (isWeekend(dow)) {
-      // Weekend team was pre-seeded before the main loop; only count fallback picks
-      // to avoid double-counting pre-seeded members.
+      // Weekend team was pre-seeded (Fri+Sat+Sun block); don't double-count.
       const satDay = dow === 6 ? d : d - 1;
       const preSeededSet = new Set(weekendNonDocTeam[satDay] || []);
       result.forEach(id => { if (!preSeededSet.has(id) && cnt[id] !== undefined) cnt[id]++; });
+    } else if (isFriday(dow)) {
+      // Friday uses next weekend's team; only skip increment if that Sat was pre-seeded
+      // (i.e. it's not locked — locked weekends aren't in weekendNonDocTeam pre-seed).
+      const satDay = d + 1;
+      const nextSatPreseeded = satDay <= days && !(lockedDays && lockedDays.has(satDay));
+      const preSeededFriSet = nextSatPreseeded ? new Set(weekendNonDocTeam[satDay] || []) : new Set();
+      result.forEach(id => { if (!preSeededFriSet.has(id) && cnt[id] !== undefined) cnt[id]++; });
     } else {
       result.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
     }
