@@ -11,7 +11,7 @@ const ROLE_LABELS = { doctor: "醫師", radiologist: "放射師", nurse: "護理
 const ROLE_COLORS = { doctor: "#16a34a", radiologist: "#1d4ed8", nurse: "#dc2626", other: "#64748b" };
 const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706","#db2777","#0284c7","#9333ea"];
 const ROLE_ORDER = { doctor: 0, radiologist: 1, nurse: 2, other: 3 };
-const DEFAULT_RULES = { weekday_doctor:1, weekday_rad_nurse:3, weekend_doctor:1, weekend_radiologist:1, weekend_nurse:1, max_consecutive:2 };
+const DEFAULT_RULES = { weekday_rad_nurse:3, weekend_radiologist:1, weekend_nurse:1, max_consecutive:2 };
 
 function getDaysInMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
 function getDow(y, m, d) { return new Date(y, m, d).getDay(); }
@@ -1208,13 +1208,6 @@ export default function CathScheduler() {
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>📆 平日規則（週一至週五）</div>
                     <div style={S.formRow}>
-                      <label style={S.formLabel}>醫師</label>
-                      <input style={{ ...S.formInput, maxWidth: 64 }} type="number" min="0" max="10"
-                        value={editingRules.weekday_doctor}
-                        onChange={e => setEditingRules(r => ({ ...r, weekday_doctor: parseInt(e.target.value) || 0 }))} />
-                      <span style={S.ruleUnit}>位</span>
-                    </div>
-                    <div style={S.formRow}>
                       <label style={S.formLabel}>放射師＋護理師</label>
                       <input style={{ ...S.formInput, maxWidth: 64 }} type="number" min="0" max="10"
                         value={editingRules.weekday_rad_nurse}
@@ -1226,13 +1219,6 @@ export default function CathScheduler() {
                   {/* Weekend/holiday rules */}
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>🌙 假日／週末規則</div>
-                    <div style={S.formRow}>
-                      <label style={S.formLabel}>醫師</label>
-                      <input style={{ ...S.formInput, maxWidth: 64 }} type="number" min="0" max="10"
-                        value={editingRules.weekend_doctor}
-                        onChange={e => setEditingRules(r => ({ ...r, weekend_doctor: parseInt(e.target.value) || 0 }))} />
-                      <span style={S.ruleUnit}>位</span>
-                    </div>
                     <div style={S.formRow}>
                       <label style={S.formLabel}>放射師</label>
                       <input style={{ ...S.formInput, maxWidth: 64 }} type="number" min="0" max="10"
@@ -1276,12 +1262,10 @@ export default function CathScheduler() {
                 <div>
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>📆 平日規則</div>
-                    <div style={S.ruleRow}><span style={S.ruleLabel}>醫師</span><span style={S.ruleValue}>{rules.weekday_doctor} 位</span></div>
                     <div style={S.ruleRow}><span style={S.ruleLabel}>放射師＋護理師合計</span><span style={S.ruleValue}>{rules.weekday_rad_nurse} 位</span></div>
                   </div>
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>🌙 假日／週末規則</div>
-                    <div style={S.ruleRow}><span style={S.ruleLabel}>醫師</span><span style={S.ruleValue}>{rules.weekend_doctor} 位</span></div>
                     <div style={S.ruleRow}><span style={S.ruleLabel}>放射師</span><span style={S.ruleValue}>{rules.weekend_radiologist} 位</span></div>
                     <div style={S.ruleRow}><span style={S.ruleLabel}>護理師</span><span style={S.ruleValue}>{rules.weekend_nurse} 位</span></div>
                   </div>
