@@ -91,16 +91,31 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
 
     } else {
       const maxC = r.max_consecutive;
+      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
 
+      // Guaranteed: weekday_doctor doctors
       const docPool = avail.filter(m => m.role === "doctor");
-      const docEligible = docPool.filter(m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC);
-      const doctors = pick(docEligible, cnt, r.weekday_doctor, docPool, sel, pairsMap);
+      const doctors = pick(docPool.filter(eligible), cnt, r.weekday_doctor, docPool, sel, pairsMap);
       doctors.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
-      const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-      const rnEligible = rnPool.filter(m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC);
-      const rn = pick(rnEligible, cnt, r.weekday_rad_nurse, rnPool, sel, pairsMap);
-      rn.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      // Guaranteed: at least 1 radiologist
+      const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
+      const radsMin = pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap);
+      radsMin.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+
+      // Guaranteed: at least 1 nurse
+      const nursePool = avail.filter(m => m.role === "nurse" && !used.has(m.id));
+      const nursesMin = pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap);
+      nursesMin.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+
+      // Fill remaining rad/nurse slots
+      const filled = radsMin.length + nursesMin.length;
+      const remaining = r.weekday_rad_nurse - filled;
+      if (remaining > 0) {
+        const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
+        const rn = pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap);
+        rn.forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
+      }
     }
 
     sched[d] = result;
@@ -716,95 +731,100 @@ export default function CathScheduler() {
             })}
           </div>
 
-          {selectedDay && !editMode && (
-            <div style={S.panel}>
-              <div style={S.panelHeader}>
-                <div style={S.panelTitle}>
-                  {month + 1}/{selectedDay}（{DOW_LABELS[getDow(year, month, selectedDay)]}）
-                  {isWeekend(getDow(year, month, selectedDay)) && <span style={S.panelBadgeWG}>🌙 週末</span>}
-                  {lockedDays.has(selectedDay) && <span style={S.panelBadgeLock}>🔒 已鎖定</span>}
-                  {holidayMap[selectedDay] && <span style={S.panelBadgeHol}>🎌 {holidayMap[selectedDay]}</span>}
-                </div>
-                <button style={S.panelClose} onClick={() => setSelectedDay(null)}>✕</button>
-              </div>
+        </div>
+      )}
 
-              {/* On-call list with phone — visible to all */}
-              <div style={S.panelLabel}>📋 今日 On-Call</div>
-              {(schedule[selectedDay] || []).length === 0
-                ? <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12 }}>尚未排班</div>
-                : (
-                  <div style={S.oncallList}>
-                    {(schedule[selectedDay] || []).map(id => {
-                      const mbr = getMember(id);
-                      if (!mbr) return null;
-                      const color = ROLE_COLORS[mbr.role];
-                      return (
-                        <div key={id} style={{ ...S.oncallCard, borderLeftColor: color }}>
-                          <div style={S.oncallCardLeft}>
-                            <span style={{ ...S.roleTag, background: color + "18", color }}>{ROLE_LABELS[mbr.role]}</span>
-                            <span style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>{mbr.name}</span>
-                          </div>
-                          {mbr.phone ? (
-                            <a href={`tel:${mbr.phone}`} style={{ ...S.phoneBtn, borderColor: color + "60", color }}>
-                              📞 {mbr.phone}
-                            </a>
-                          ) : (
-                            <span style={{ fontSize: 12, color: "#cbd5e1" }}>無電話</span>
-                          )}
+      {/* ── Day detail modal (all users, non-edit) ── */}
+      {selectedDay && !editMode && (
+        <div style={S.modalOverlay} onClick={() => setSelectedDay(null)}>
+          <div style={{ ...S.modalBox, maxWidth: 480, width: "94vw", maxHeight: "85vh", overflowY: "auto" }} onClick={e => e.stopPropagation()}>
+            <div style={S.panelHeader}>
+              <div style={S.panelTitle}>
+                {month + 1}/{selectedDay}（{DOW_LABELS[getDow(year, month, selectedDay)]}）
+                {isWeekend(getDow(year, month, selectedDay)) && <span style={S.panelBadgeWG}>🌙 週末</span>}
+                {lockedDays.has(selectedDay) && <span style={S.panelBadgeLock}>🔒 已鎖定</span>}
+                {holidayMap[selectedDay] && <span style={S.panelBadgeHol}>🎌 {holidayMap[selectedDay]}</span>}
+              </div>
+              <button style={S.panelClose} onClick={() => setSelectedDay(null)}>✕</button>
+            </div>
+
+            <div style={S.panelLabel}>📋 今日 On-Call</div>
+            {(schedule[selectedDay] || []).length === 0
+              ? <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12 }}>尚未排班</div>
+              : (
+                <div style={S.oncallList}>
+                  {(schedule[selectedDay] || []).map(id => {
+                    const mbr = getMember(id);
+                    if (!mbr) return null;
+                    const color = ROLE_COLORS[mbr.role];
+                    return (
+                      <div key={id} style={{ ...S.oncallCard, borderLeftColor: color }}>
+                        <div style={S.oncallCardLeft}>
+                          <span style={{ ...S.roleTag, background: color + "18", color }}>{ROLE_LABELS[mbr.role]}</span>
+                          <span style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>{mbr.name}</span>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-              {/* Admin edit controls */}
-              {isAdmin && (
-                <>
-                  <div style={{ ...S.panelLabel, marginTop: 14, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
-                    ✏️ 編輯值班人員
-                  </div>
-                  <div style={S.memberRow}>
-                    {members.map(mbr => {
-                      const on = (schedule[selectedDay] || []).includes(mbr.id);
-                      const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
-                      return (
-                        <button key={mbr.id} disabled={lv || saving} title={lv ? "請假中" : on ? "點擊移除" : "點擊加入"}
-                          style={{ ...S.memberToggle, ...(on ? { background: ROLE_COLORS[mbr.role], color: "#fff", borderColor: ROLE_COLORS[mbr.role], boxShadow: `0 2px 8px ${ROLE_COLORS[mbr.role]}50` } : {}), ...(lv ? S.memberOnLeave : {}) }}
-                          onClick={() => !lv && !saving && toggleAssign(selectedDay, mbr.id)}>
-                          <span>{lv ? "🚫" : on ? "✓ " : "+ "}</span>
-                          <span>{mbr.name}</span>
-                          <span style={{ ...S.roleTag, background: on ? "#fff3" : ROLE_COLORS[mbr.role] + "18", color: on ? "#fff" : ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </>
+                        {mbr.phone ? (
+                          <a href={`tel:${mbr.phone}`} style={{ ...S.phoneBtn, borderColor: color + "60", color }}>
+                            📞 {mbr.phone}
+                          </a>
+                        ) : (
+                          <span style={{ fontSize: 12, color: "#cbd5e1" }}>無電話</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               )}
-            </div>
-          )}
 
-          {selectedDay && editMode && isAdmin && (
-            <div style={{ ...S.panel, borderColor: "#f59e0b60" }}>
-              <div style={S.panelHeader}>
-                <div style={{ ...S.panelTitle, color: "#b45309" }}>✏️ {month + 1}/{selectedDay} — 新增人員</div>
-                <button style={S.panelClose} onClick={() => setSelectedDay(null)}>✕</button>
-              </div>
-              <div style={S.memberRow}>
-                {members.map(mbr => {
-                  const on = (schedule[selectedDay] || []).includes(mbr.id);
-                  const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
-                  if (on || lv) return null;
-                  return (
-                    <button key={mbr.id} disabled={saving} style={S.memberToggle}
-                      onClick={() => { toggleAssign(selectedDay, mbr.id); setSelectedDay(null); }}>
-                      + {mbr.name}
-                      <span style={{ ...S.roleTag, background: ROLE_COLORS[mbr.role] + "18", color: ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
-                    </button>
-                  );
-                })}
-              </div>
+            {isAdmin && (
+              <>
+                <div style={{ ...S.panelLabel, marginTop: 14, borderTop: "1px solid #e2e8f0", paddingTop: 14 }}>
+                  ✏️ 編輯值班人員
+                </div>
+                <div style={S.memberRow}>
+                  {members.map(mbr => {
+                    const on = (schedule[selectedDay] || []).includes(mbr.id);
+                    const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
+                    return (
+                      <button key={mbr.id} disabled={lv || saving} title={lv ? "請假中" : on ? "點擊移除" : "點擊加入"}
+                        style={{ ...S.memberToggle, ...(on ? { background: ROLE_COLORS[mbr.role], color: "#fff", borderColor: ROLE_COLORS[mbr.role], boxShadow: `0 2px 8px ${ROLE_COLORS[mbr.role]}50` } : {}), ...(lv ? S.memberOnLeave : {}) }}
+                        onClick={() => !lv && !saving && toggleAssign(selectedDay, mbr.id)}>
+                        <span>{lv ? "🚫" : on ? "✓ " : "+ "}</span>
+                        <span>{mbr.name}</span>
+                        <span style={{ ...S.roleTag, background: on ? "#fff3" : ROLE_COLORS[mbr.role] + "18", color: on ? "#fff" : ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Edit mode add-member modal ── */}
+      {selectedDay && editMode && isAdmin && (
+        <div style={S.modalOverlay} onClick={() => setSelectedDay(null)}>
+          <div style={{ ...S.modalBox, maxWidth: 420, width: "94vw" }} onClick={e => e.stopPropagation()}>
+            <div style={S.panelHeader}>
+              <div style={{ ...S.panelTitle, color: "#b45309" }}>✏️ {month + 1}/{selectedDay} — 新增人員</div>
+              <button style={S.panelClose} onClick={() => setSelectedDay(null)}>✕</button>
             </div>
-          )}
+            <div style={S.memberRow}>
+              {members.map(mbr => {
+                const on = (schedule[selectedDay] || []).includes(mbr.id);
+                const lv = (leaveMap[selectedDay] || []).includes(mbr.id);
+                if (on || lv) return null;
+                return (
+                  <button key={mbr.id} disabled={saving} style={S.memberToggle}
+                    onClick={() => { toggleAssign(selectedDay, mbr.id); setSelectedDay(null); }}>
+                    + {mbr.name}
+                    <span style={{ ...S.roleTag, background: ROLE_COLORS[mbr.role] + "18", color: ROLE_COLORS[mbr.role] }}>{ROLE_LABELS[mbr.role]}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
       )}
 
