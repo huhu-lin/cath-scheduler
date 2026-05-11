@@ -10,6 +10,7 @@ const ROLES = ["doctor", "radiologist", "nurse", "other"];
 const ROLE_LABELS = { doctor: "醫師", radiologist: "放射師", nurse: "護理師", other: "其他" };
 const ROLE_COLORS = { doctor: "#16a34a", radiologist: "#1d4ed8", nurse: "#dc2626", other: "#64748b" };
 const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706","#db2777","#0284c7","#9333ea"];
+const ROLE_ORDER = { doctor: 0, radiologist: 1, nurse: 2, other: 3 };
 const DEFAULT_RULES = { weekday_doctor:1, weekday_rad_nurse:3, weekend_doctor:1, weekend_radiologist:1, weekend_nurse:1, max_consecutive:2 };
 
 function getDaysInMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
@@ -45,7 +46,7 @@ function pick(pool, cnt, n, fallback, selectedIds, pairsMap) {
   return sorted.length >= n ? sorted.slice(0, n) : sortByScore(fallback, cnt, selectedIds, pairsMap).slice(0, n);
 }
 
-function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs) {
+function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule) {
   const r = rules || DEFAULT_RULES;
   const days = getDaysInMonth(year, month);
   const sched = {};
@@ -98,8 +99,65 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
 
   for (let d = 1; d <= days; d++) {
     if (lockedDays && lockedDays.has(d)) {
-      sched[d] = existingSched[d] || [];
-      sched[d].forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+      // Keep manually-assigned members; auto-fill the remaining slots
+      const manualIds = (manualSchedule && manualSchedule[d]) ? [...manualSchedule[d]] : (existingSched[d] || []);
+      const usedIds = new Set(manualIds);
+      const result = [...manualIds];
+      const sel = new Set(manualIds);
+      const lv = leave[d] || [];
+      const avail = members.filter(m => !lv.includes(m.id) && !usedIds.has(m.id));
+      const maxC = r.max_consecutive;
+      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
+      const numDoc   = manualIds.filter(id => getMember(id)?.role === "doctor").length;
+      const numRad   = manualIds.filter(id => getMember(id)?.role === "radiologist").length;
+      const numNurse = manualIds.filter(id => getMember(id)?.role === "nurse").length;
+
+      if (isWeekend(getDow(year, month, d))) {
+        const satDay = getDow(year, month, d) === 6 ? d : d - 1;
+        const preTeam = (weekendNonDocTeam[satDay] || []).filter(id => !usedIds.has(id) && !lv.includes(id));
+        const needDoc = Math.max(0, r.weekend_doctor - numDoc);
+        if (needDoc > 0) {
+          const pool = avail.filter(m => m.role === "doctor");
+          pick(pool, cnt, needDoc, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+        }
+        if (preTeam.length > 0) {
+          preTeam.forEach(id => { result.push(id); usedIds.add(id); sel.add(id); });
+        } else {
+          const needRad   = Math.max(0, r.weekend_radiologist - numRad);
+          const needNurse = Math.max(0, r.weekend_nurse - numNurse);
+          if (needRad > 0) {
+            const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
+            pick(pool, cnt, needRad, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          }
+          if (needNurse > 0) {
+            const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
+            pick(pool, cnt, needNurse, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          }
+        }
+      } else {
+        // Weekday (Mon–Fri): fill to weekday quotas
+        const needDoc = Math.max(0, r.weekday_doctor - numDoc);
+        if (needDoc > 0) {
+          const pool = avail.filter(m => m.role === "doctor");
+          pick(pool.filter(eligible), cnt, needDoc, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+        }
+        if (numRad === 0) {
+          const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+        }
+        if (numNurse === 0) {
+          const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+        }
+        const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
+        const remaining = r.weekday_rad_nurse - currentRN;
+        if (remaining > 0) {
+          const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
+          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap).forEach(m => { result.push(m.id); sel.add(m.id); });
+        }
+      }
+      sched[d] = result;
+      result.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
       continue;
     }
     if (holidayDays && holidayDays.has(d)) {
@@ -234,12 +292,15 @@ async function dbFetchSchedule(year, month) {
   if (error) throw error;
   const schedule = {};
   const lockedDays = new Set();
+  const manualSchedule = {};
   for (const row of data) {
-    if (!schedule[row.day]) schedule[row.day] = [];
-    schedule[row.day].push(row.member_id);
-    if (row.manually_set) lockedDays.add(row.day);
+    (schedule[row.day] = schedule[row.day] || []).push(row.member_id);
+    if (row.manually_set) {
+      lockedDays.add(row.day);
+      (manualSchedule[row.day] = manualSchedule[row.day] || []).push(row.member_id);
+    }
   }
-  return { schedule, lockedDays };
+  return { schedule, lockedDays, manualSchedule };
 }
 
 async function dbFetchLeave(year, month) {
@@ -323,6 +384,7 @@ export default function CathScheduler() {
   const [schedule, setSchedule]     = useState({});
   const [leaveMap, setLeaveMap]     = useState({});
   const [lockedDays, setLockedDays] = useState(new Set());
+  const [manualSchedule, setManualSchedule] = useState({});
   const [holidays, setHolidays]     = useState([]);
   const [rules, setRules]           = useState(DEFAULT_RULES);
   const [view, setView]         = useState("calendar");
@@ -412,7 +474,7 @@ export default function CathScheduler() {
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [mData, { schedule: sData, lockedDays: ld }, lData, hData, rData, pData] = await Promise.all([
+      const [mData, { schedule: sData, lockedDays: ld, manualSchedule: ms }, lData, hData, rData, pData] = await Promise.all([
         dbFetchMembers(),
         dbFetchSchedule(year, month),
         dbFetchLeave(year, month),
@@ -420,7 +482,7 @@ export default function CathScheduler() {
         dbFetchRules(),
         dbFetchPairs(),
       ]);
-      setMembers(mData); setSchedule(sData); setLockedDays(ld);
+      setMembers(mData); setSchedule(sData); setLockedDays(ld); setManualSchedule(ms);
       setLeaveMap(lData); setHolidays(hData); setRules(rData); setPairs(pData);
     } catch (e) { notify("⚠️ 載入失敗：" + e.message, "err"); }
     setLoading(false);
@@ -436,17 +498,18 @@ export default function CathScheduler() {
         .eq("year", year).eq("month", month).eq("manually_set", false);
       const rows = [];
       for (const [day, ids] of Object.entries(newSched)) {
-        if (lockedDays.has(parseInt(day))) continue;
-        for (const member_id of ids)
-          rows.push({ year, month, day: parseInt(day), member_id, manually_set: false });
+        const d = parseInt(day);
+        const manualSet = new Set(manualSchedule[d] || []);
+        for (const member_id of ids) {
+          if (!manualSet.has(member_id))
+            rows.push({ year, month, day: d, member_id, manually_set: false });
+        }
       }
       if (rows.length > 0) {
         const { error } = await supabase.from("schedules").insert(rows);
         if (error) throw error;
       }
-      const merged = { ...newSched };
-      lockedDays.forEach(d => { merged[d] = schedule[d] || []; });
-      setSchedule(merged);
+      setSchedule(newSched);
       notify("✅ 班表已儲存");
     } catch (e) { notify("❌ 儲存失敗：" + e.message, "err"); }
     setSaving(false);
@@ -462,16 +525,16 @@ export default function CathScheduler() {
         const { error } = await supabase.from("schedules").delete()
           .eq("year", year).eq("month", month).eq("day", day).eq("member_id", memberId);
         if (error) throw error;
-        const newArr = arr.filter(x => x !== memberId);
-        setSchedule(prev => ({ ...prev, [day]: newArr }));
-        if (newArr.length === 0)
+        setSchedule(prev => ({ ...prev, [day]: arr.filter(x => x !== memberId) }));
+        const newManual = (manualSchedule[day] || []).filter(x => x !== memberId);
+        setManualSchedule(prev => ({ ...prev, [day]: newManual }));
+        if (newManual.length === 0)
           setLockedDays(prev => { const s = new Set(prev); s.delete(day); return s; });
       } else {
         const { error } = await supabase.from("schedules").insert({ year, month, day, member_id: memberId, manually_set: true });
         if (error) throw error;
-        await supabase.from("schedules").update({ manually_set: true })
-          .eq("year", year).eq("month", month).eq("day", day);
         setSchedule(prev => ({ ...prev, [day]: [...arr, memberId] }));
+        setManualSchedule(prev => ({ ...prev, [day]: [...(prev[day] || []), memberId] }));
         setLockedDays(prev => new Set([...prev, day]));
       }
     } catch (e) { notify("❌ 操作失敗：" + e.message, "err"); }
@@ -508,8 +571,22 @@ export default function CathScheduler() {
     const holidayDays = new Set(
       holidays.filter(h => h.year === year && h.month === month + 1).map(h => h.day)
     );
-    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules, pairs);
+    const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules, pairs, manualSchedule);
     saveFullSchedule(gen);
+  }
+
+  async function handleClearSchedule() {
+    if (!window.confirm(`確定要清除 ${year}年${month + 1}月 所有排班（包含手動鎖定）？`)) return;
+    setSaving(true);
+    try {
+      const { error } = await supabase.from("schedules").delete().eq("year", year).eq("month", month);
+      if (error) throw error;
+      setSchedule({});
+      setLockedDays(new Set());
+      setManualSchedule({});
+      notify("🗑️ 班表已清除");
+    } catch (e) { notify("❌ 清除失敗：" + e.message, "err"); }
+    setSaving(false);
   }
 
   // ── Member CRUD ─────────────────────────────────────────────
@@ -757,6 +834,7 @@ export default function CathScheduler() {
               onClick={() => { setEditMode(e => !e); setSelectedDay(null); }}>
               ✏️ {editMode ? "完成編輯" : "手動調整"}
             </button>
+            <button style={S.clearBtn} onClick={handleClearSchedule} disabled={saving || loading}>🗑️ 清除</button>
           </>
         )}
         <button style={S.reloadBtn} onClick={loadAll} disabled={loading}>↺</button>
@@ -797,7 +875,7 @@ export default function CathScheduler() {
                   <div style={S.cellDow}>{DOW_LABELS[dow]}{wg ? " 🌙" : fri ? " ★" : ""}</div>
                   {holName && <div style={S.holidayLabel}>{holName}</div>}
                   <div style={S.cellMembers}>
-                    {assigned.map(id => {
+                    {[...assigned].sort((a, b) => (ROLE_ORDER[getMember(a)?.role] ?? 9) - (ROLE_ORDER[getMember(b)?.role] ?? 9)).map(id => {
                       const mbr = getMember(id);
                       if (!mbr) return null;
                       return (
@@ -842,7 +920,7 @@ export default function CathScheduler() {
               ? <div style={{ color: "#94a3b8", fontSize: 13, marginBottom: 12 }}>尚未排班</div>
               : (
                 <div style={S.oncallList}>
-                  {(schedule[selectedDay] || []).map(id => {
+                  {[...(schedule[selectedDay] || [])].sort((a, b) => (ROLE_ORDER[getMember(a)?.role] ?? 9) - (ROLE_ORDER[getMember(b)?.role] ?? 9)).map(id => {
                     const mbr = getMember(id);
                     if (!mbr) return null;
                     const color = ROLE_COLORS[mbr.role];
@@ -1273,6 +1351,7 @@ const S = {
   genBtn: { marginLeft: "auto", padding: "8px 16px", background: "#0891b2", color: "#fff", border: "none", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14, boxShadow: "0 2px 8px #0891b230" },
   editToggleBtn: { padding: "8px 16px", background: "#fff", color: "#92400e", border: "1.5px solid #fcd34d", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
   editToggleBtnActive: { background: "#fef3c7", color: "#92400e", borderColor: "#f59e0b", boxShadow: "0 2px 8px #f59e0b30" },
+  clearBtn: { padding: "8px 14px", background: "#fff", color: "#dc2626", border: "1.5px solid #fca5a5", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
   reloadBtn: { width: 34, height: 34, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
   loadingBar: { height: 3, background: "#e0f2fe", overflow: "hidden" },
   loadingFill: { height: "100%", width: "60%", background: "#0891b2" },
