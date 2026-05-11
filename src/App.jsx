@@ -86,6 +86,16 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     weekendNonDocTeam[sat] = team;
   }
 
+  // Pre-seed cnt with expected weekend shifts so weekday selection deprioritises
+  // staff who already have weekend duties this month.
+  for (let d = 1; d <= days; d++) {
+    if (getDow(year, month, d) !== 6) continue;
+    const team = weekendNonDocTeam[d] || [];
+    const sun = d + 1;
+    const daysWorked = sun <= days ? 2 : 1; // Sat + Sun (or just Sat at month-end)
+    team.forEach(id => { if (cnt[id] !== undefined) cnt[id] += daysWorked; });
+  }
+
   for (let d = 1; d <= days; d++) {
     if (lockedDays && lockedDays.has(d)) {
       sched[d] = existingSched[d] || [];
