@@ -1,427 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
-import { createClient } from "@supabase/supabase-js";
-
-const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY
-);
-
-const ROLES = ["doctor", "radiologist", "nurse", "other"];
-const ROLE_LABELS = { doctor: "醫師", radiologist: "放射師", nurse: "護理師", other: "其他" };
-const ROLE_COLORS = { doctor: "#16a34a", radiologist: "#1d4ed8", nurse: "#dc2626", other: "#64748b" };
-const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706","#db2777","#0284c7","#9333ea"];
-const ROLE_ORDER = { doctor: 0, radiologist: 1, nurse: 2, other: 3 };
-const DEFAULT_RULES = { weekday_rad_nurse:3, weekend_radiologist:1, weekend_nurse:1, max_consecutive:2 };
-
-function getDaysInMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
-function getDow(y, m, d) { return new Date(y, m, d).getDay(); }
-function isWeekend(dow) { return dow === 0 || dow === 6; }
-function isFriday(dow) { return dow === 5; }
-
-// Consecutive weekday streak — weekends and national holidays break/reset the streak
-function getStreak(sched, day, memberId, year, month, holidayDays) {
-  let s = 0;
-  for (let d = day - 1; d >= 1; d--) {
-    const dow = getDow(year, month, d);
-    if (isWeekend(dow) || (holidayDays && holidayDays.has(d))) break;
-    if ((sched[d] || []).includes(memberId)) s++;
-    else break;
-  }
-  return s;
-}
-
-// Sort pool: balance (soft cap at floor(avg)+1) > pair bonus > fewer calls
-// useRandom: add small noise so equal-score members get shuffled differently each run
-function sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, personalCap = null) {
-  const poolAvg = pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0;
-  const scores = new Map(pool.map(m => {
-    const cap = personalCap ? (personalCap.get(m.id) ?? Math.floor(poolAvg) + 1) : Math.floor(poolAvg) + 1;
-    const paired = (pairsMap[m.id] || []).some(pid => selectedIds && selectedIds.has(pid));
-    const overCap = (cnt[m.id] || 0) >= cap ? 100000 : 0;
-    const noise = useRandom ? Math.random() * 0.9 : 0;
-    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + overCap + noise];
-  }));
-  return pool.slice().sort((a, b) => scores.get(a.id) - scores.get(b.id));
-}
-
-function pick(pool, cnt, n, fallback, selectedIds, pairsMap, useRandom, personalCap = null) {
-  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, personalCap);
-  return sorted.length >= n
-    ? sorted.slice(0, n)
-    : sortByScore(fallback, cnt, selectedIds, pairsMap, useRandom, personalCap).slice(0, n);
-}
-
-function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom) {
-  const r = rules || DEFAULT_RULES;
-  const days = getDaysInMonth(year, month);
-  const sched = {};
-  const cnt = Object.fromEntries(members.map(m => [m.id, 0]));
-  const getMember = id => members.find(m => m.id === id);
-
-  // Build pairs lookup: member_id → [partner_ids]
-  const pairsMap = {};
-  for (const p of (pairs || [])) {
-    (pairsMap[p.member_id_1] = pairsMap[p.member_id_1] || []).push(p.member_id_2);
-    (pairsMap[p.member_id_2] = pairsMap[p.member_id_2] || []).push(p.member_id_1);
-  }
-
-  // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team.
-  // Use a dedicated counter so successive weekends rotate to different staff.
-  const weekendNonDocTeam = {}; // satDay → [memberId, ...]
-  const wkndCnt = Object.fromEntries(members.map(m => [m.id, 0]));
-  for (let d = 1; d <= days; d++) {
-    if (getDow(year, month, d) !== 6) continue; // only Saturdays
-    const sat = d, sun = d + 1;
-    const satLv = leave[sat] || [];
-    const sunLv = sun <= days ? (leave[sun] || []) : [];
-    // Pick members available on BOTH Sat and Sun (or just Sat if Sun is next month)
-    const availBoth = members.filter(m =>
-      (m.role === "radiologist" || m.role === "nurse") &&
-      !satLv.includes(m.id) &&
-      (sun > days || !sunLv.includes(m.id))
-    );
-    const sel = new Set(), used = new Set(), team = [];
-    const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
-      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom);
-    rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
-    const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), wkndCnt, r.weekend_nurse,
-      availBoth.filter(m => m.role === "nurse"), sel, pairsMap, useRandom);
-    nurses.forEach(m => { team.push(m.id); });
-    // Update wkndCnt so next weekend favours different staff
-    team.forEach(id => { if (wkndCnt[id] !== undefined) wkndCnt[id]++; });
-    weekendNonDocTeam[sat] = team;
-  }
-
-  // Pre-seed cnt with weekend shifts so weekday selection deprioritises
-  // staff who already have weekend duties this month.
-  // Skip locked weekends — those use manualSchedule, not weekendNonDocTeam.
-  // Also include the preceding Friday if it's a normal working day — the Friday
-  // logic uses the same weekend team, so their total "block" is Fri+Sat+Sun.
-  for (let d = 1; d <= days; d++) {
-    if (getDow(year, month, d) !== 6) continue;
-    if (lockedDays && lockedDays.has(d)) continue;
-    const team = weekendNonDocTeam[d] || [];
-    const sun = d + 1;
-    let daysWorked = sun <= days ? 2 : 1; // Sat + Sun (or just Sat at month-end)
-    // Count the preceding Friday if it's a normal non-holiday, non-locked weekday
-    const fri = d - 1;
-    if (fri >= 1 && !isWeekend(getDow(year, month, fri)) &&
-        !(lockedDays && lockedDays.has(fri)) &&
-        !(holidayDays && holidayDays.has(fri))) {
-      daysWorked += 1;
-    }
-    team.forEach(id => { if (cnt[id] !== undefined) cnt[id] += daysWorked; });
-  }
-
-  // Pre-seed cnt with all locked-day manual assignments so that auto-assigned
-  // days (which may come before the locked day in the loop) correctly
-  // deprioritise staff who already have manual shifts later in the month.
-  if (lockedDays) {
-    for (let d = 1; d <= days; d++) {
-      if (!lockedDays.has(d)) continue;
-      const ids = (manualSchedule && manualSchedule[d]) ? manualSchedule[d] : (existingSched[d] || []);
-      ids.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
-    }
-  }
-
-  // Compute per-person shift targets: total shifts / staff count.
-  // e.g. 20 weekdays×3 + 9 weekends×2 = 78 / 9 staff = 8.67 → 6 people get 9, 3 get 8.
-  // Randomly decide who gets the extra day so the gap is always ≤ 1.
-  let totalNonDoctorShifts = 0;
-  for (let d = 1; d <= days; d++) {
-    const dow = getDow(year, month, d);
-    if (holidayDays && holidayDays.has(d)) {
-      const ids = (manualSchedule && manualSchedule[d]) ? [...manualSchedule[d]] : (existingSched[d] || []);
-      totalNonDoctorShifts += ids.filter(id => members.find(m => m.id === id)?.role !== "doctor").length;
-    } else if (isWeekend(dow)) {
-      totalNonDoctorShifts += r.weekend_radiologist + r.weekend_nurse;
-    } else {
-      totalNonDoctorShifts += r.weekday_rad_nurse;
-    }
-  }
-  const nonDoctors = members.filter(m => m.role !== "doctor");
-  let personalCap = null;
-  if (nonDoctors.length > 0) {
-    const base = Math.floor(totalNonDoctorShifts / nonDoctors.length);
-    const extra = totalNonDoctorShifts - base * nonDoctors.length;
-    const shuffled = [...nonDoctors];
-    if (useRandom) {
-      for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-      }
-    }
-    personalCap = new Map(shuffled.map((m, i) => [m.id, i < extra ? base + 1 : base]));
-  }
-
-  for (let d = 1; d <= days; d++) {
-    if (lockedDays && lockedDays.has(d)) {
-      const manualIds = (manualSchedule && manualSchedule[d]) ? [...manualSchedule[d]] : (existingSched[d] || []);
-      // On holidays, keep only the manual assignments — no auto-fill
-      if (holidayDays && holidayDays.has(d)) {
-        sched[d] = manualIds;
-        // manual members already pre-seeded; no cnt increment needed
-        continue;
-      }
-      // Keep manually-assigned members; auto-fill the remaining slots
-      const usedIds = new Set(manualIds);
-      const result = [...manualIds];
-      const sel = new Set(manualIds);
-      const lv = leave[d] || [];
-      const avail = members.filter(m => !lv.includes(m.id) && !usedIds.has(m.id));
-      const maxC = r.max_consecutive;
-      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
-      const numRad   = manualIds.filter(id => getMember(id)?.role === "radiologist").length;
-      const numNurse = manualIds.filter(id => getMember(id)?.role === "nurse").length;
-
-      if (isWeekend(getDow(year, month, d))) {
-        // Respect manual assignments; only fill up to quota
-        const needRad   = Math.max(0, r.weekend_radiologist - numRad);
-        const needNurse = Math.max(0, r.weekend_nurse - numNurse);
-        if (needRad > 0) {
-          const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-        if (needNurse > 0) {
-          const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-      } else {
-        // Weekday (Mon–Fri): fill to weekday quotas
-        if (numRad === 0) {
-          const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-        if (numNurse === 0) {
-          const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-        const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
-        const remaining = r.weekday_rad_nurse - currentRN;
-        if (remaining > 0) {
-          const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
-        }
-      }
-      sched[d] = result;
-      // Manual members were pre-seeded; only count the auto-filled additions
-      result.filter(id => !manualIds.includes(id)).forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
-      continue;
-    }
-    if (holidayDays && holidayDays.has(d)) {
-      sched[d] = existingSched[d] || [];
-      continue;
-    }
-
-    const dow = getDow(year, month, d);
-    const lv = leave[d] || [];
-    const avail = members.filter(m => !lv.includes(m.id));
-    const result = [];
-    const sel = new Set();
-
-    if (isWeekend(dow)) {
-      // Non-doctors: use the pre-computed shared team (same on Sat and Sun)
-      const satDay = dow === 6 ? d : d - 1;
-      const team = weekendNonDocTeam[satDay] || [];
-      if (team.length > 0) {
-        team.filter(id => !lv.includes(id) && !result.includes(id))
-          .forEach(id => { result.push(id); sel.add(id); });
-      } else {
-        // Fallback: generate independently (e.g. sat was a holiday)
-        const used = new Set(result);
-        pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
-          avail.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom, personalCap)
-          .forEach(m => { result.push(m.id); sel.add(m.id); used.add(m.id); });
-        pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
-          avail.filter(m => m.role === "nurse"), sel, pairsMap, useRandom, personalCap)
-          .forEach(m => { result.push(m.id); sel.add(m.id); });
-      }
-
-    } else if (isFriday(dow)) {
-      const maxC = r.max_consecutive;
-      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
-
-      // Non-doctors: use the following weekend's team (Sat = d+1)
-      const satDay = d + 1;
-      const team = weekendNonDocTeam[satDay] || [];
-      team.filter(id => !lv.includes(id) && !result.includes(id))
-        .forEach(id => { result.push(id); sel.add(id); });
-
-      // +1 extra rad or nurse (not already in team)
-      const extraPool = avail.filter(m =>
-        (m.role === "radiologist" || m.role === "nurse") &&
-        !result.includes(m.id) && eligible(m)
-      );
-      pick(extraPool, cnt, 1, extraPool, sel, pairsMap, useRandom, personalCap)
-        .forEach(m => { result.push(m.id); sel.add(m.id); });
-
-      // Guarantee min 1 rad and 1 nurse on Friday
-      if (!result.some(id => getMember(id)?.role === "radiologist")) {
-        const fb = avail.filter(m => m.role === "radiologist" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
-      }
-      if (!result.some(id => getMember(id)?.role === "nurse")) {
-        const fb = avail.filter(m => m.role === "nurse" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
-      }
-
-      // If no weekend team (Friday at month-end), fill with weekday rad/nurse slots
-      if (team.length === 0) {
-        const used = new Set(result);
-        const filled = result.filter(id => {
-          const role = getMember(id)?.role;
-          return role === "radiologist" || role === "nurse";
-        }).length;
-        const remaining = r.weekday_rad_nurse - filled;
-        if (remaining > 0) {
-          const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id) && eligible(m));
-          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap, useRandom, personalCap)
-            .forEach(m => { result.push(m.id); sel.add(m.id); });
-        }
-      }
-
-    } else {
-      // Mon–Thu
-      const maxC = r.max_consecutive;
-      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
-      const used = new Set();
-
-      const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
-      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, useRandom, personalCap)
-        .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-
-      const nursePool = avail.filter(m => m.role === "nurse" && !used.has(m.id));
-      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap, useRandom, personalCap)
-        .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-
-      const filled = result.filter(id => {
-        const role = getMember(id)?.role;
-        return role === "radiologist" || role === "nurse";
-      }).length;
-      const remaining = r.weekday_rad_nurse - filled;
-      if (remaining > 0) {
-        const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, useRandom, personalCap)
-          .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-      }
-    }
-
-    sched[d] = result;
-    if (isWeekend(dow)) {
-      // Weekend team was pre-seeded (Fri+Sat+Sun block); don't double-count.
-      const satDay = dow === 6 ? d : d - 1;
-      const preSeededSet = new Set(weekendNonDocTeam[satDay] || []);
-      result.forEach(id => { if (!preSeededSet.has(id) && cnt[id] !== undefined) cnt[id]++; });
-    } else if (isFriday(dow)) {
-      // Friday uses next weekend's team; only skip increment if that Sat was pre-seeded
-      // (i.e. it's not locked — locked weekends aren't in weekendNonDocTeam pre-seed).
-      const satDay = d + 1;
-      const nextSatPreseeded = satDay <= days && !(lockedDays && lockedDays.has(satDay));
-      const preSeededFriSet = nextSatPreseeded ? new Set(weekendNonDocTeam[satDay] || []) : new Set();
-      result.forEach(id => { if (!preSeededFriSet.has(id) && cnt[id] !== undefined) cnt[id]++; });
-    } else {
-      result.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
-    }
-  }
-  return sched;
-}
-
-// ── DB helpers ──────────────────────────────────────────────
-async function dbFetchMembers() {
-  const { data, error } = await supabase.from("members").select("*").order("sort_order");
-  if (error) throw error;
-  return data;
-}
-
-async function dbFetchSchedule(year, month) {
-  const { data, error } = await supabase
-    .from("schedules").select("day, member_id, manually_set")
-    .eq("year", year).eq("month", month);
-  if (error) throw error;
-  const schedule = {};
-  const lockedDays = new Set();
-  const manualSchedule = {};
-  for (const row of data) {
-    (schedule[row.day] = schedule[row.day] || []).push(row.member_id);
-    if (row.manually_set) {
-      lockedDays.add(row.day);
-      (manualSchedule[row.day] = manualSchedule[row.day] || []).push(row.member_id);
-    }
-  }
-  return { schedule, lockedDays, manualSchedule };
-}
-
-async function dbFetchLeave(year, month) {
-  const { data, error } = await supabase
-    .from("leaves").select("day, member_id")
-    .eq("year", year).eq("month", month);
-  if (error) throw error;
-  const result = {};
-  for (const row of data) {
-    if (!result[row.day]) result[row.day] = [];
-    result[row.day].push(row.member_id);
-  }
-  return result;
-}
-
-async function dbFetchHolidays(year) {
-  const { data, error } = await supabase
-    .from("holidays").select("*").eq("year", year).order("month").order("day");
-  if (error) throw error;
-  return data;
-}
-
-async function dbFetchRules() {
-  const { data, error } = await supabase.from("schedule_rules").select("*").eq("id", 1).maybeSingle();
-  if (error) throw error;
-  return data || DEFAULT_RULES;
-}
-
-async function dbFetchPairs() {
-  const { data, error } = await supabase.from("member_pairs").select("*");
-  if (error) throw error;
-  return data;
-}
-
-// ── Constants ───────────────────────────────────────────────
-const DOW_LABELS = ["日","一","二","三","四","五","六"];
-const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
-
-// ── MemberForm ───────────────────────────────────────────────
-function MemberForm({ member, onChange, onSave, onCancel, saving }) {
-  return (
-    <div style={S.formBox}>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>姓名</label>
-        <input style={S.formInput} value={member.name} onChange={e => onChange({ ...member, name: e.target.value })} />
-      </div>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>職類</label>
-        <select style={S.formSelect} value={member.role} onChange={e => onChange({ ...member, role: e.target.value })}>
-          {ROLES.map(r => <option key={r} value={r}>{ROLE_LABELS[r]}</option>)}
-        </select>
-      </div>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>電話</label>
-        <input style={S.formInput} value={member.phone || ""} onChange={e => onChange({ ...member, phone: e.target.value })} placeholder="選填" />
-      </div>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>Email</label>
-        <input style={S.formInput} type="email" value={member.email || ""} onChange={e => onChange({ ...member, email: e.target.value })} placeholder="管理員帳號用" />
-      </div>
-      <div style={S.formRow}>
-        <label style={S.formLabel}>管理員</label>
-        <input type="checkbox" checked={!!member.is_admin} onChange={e => onChange({ ...member, is_admin: e.target.checked })} style={{ width: 18, height: 18, cursor: "pointer" }} />
-      </div>
-      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-        <button style={S.btnPrimary} onClick={onSave} disabled={saving || !member.name.trim()}>
-          {saving ? "儲存中…" : "✓ 儲存"}
-        </button>
-        <button style={S.btnSecondary} onClick={onCancel}>取消</button>
-      </div>
-    </div>
-  );
-}
+import { supabase, dbFetchMembers, dbFetchSchedule, dbFetchLeave, dbFetchHolidays, dbFetchRules, dbFetchPairs } from "./lib/db.js";
+import { autoGenerate, getDaysInMonth, getDow, isWeekend, isFriday } from "./lib/scheduler.js";
+import { ROLES, ROLE_LABELS, ROLE_COLORS, DEFAULT_COLORS, ROLE_ORDER, DEFAULT_RULES, DOW_LABELS, MONTH_NAMES } from "./lib/constants.js";
+import { S } from "./styles.js";
+import MemberForm from "./components/MemberForm.jsx";
 
 // ── Main component ───────────────────────────────────────────
 export default function CathScheduler() {
@@ -685,13 +267,15 @@ export default function CathScheduler() {
       for (let d = 1; d <= getDaysInMonth(year, month); d++) {
         if ((newManual[d] || []).length > 0) newLocked.add(d);
       }
-      // Preserve locks from non-doctor manual entries
-      lockedDays.forEach(d => { if ((manualSchedule[d] || []).some(id => !docSet.has(id))) newLocked.add(d); });
+      // Preserve existing locked days for non-doctor manual assignments
+      lockedDays.forEach(d => {
+        if ((manualSchedule[d] || []).some(id => !docSet.has(id))) newLocked.add(d);
+      });
       setSchedule(newSched);
       setManualSchedule(newManual);
       setLockedDays(newLocked);
       setDoctorFillOpen(false);
-      notify("✅ 醫師班表已儲存");
+      notify("✅ 醫師班已儲存");
     } catch (e) { notify("❌ 儲存失敗：" + e.message, "err"); }
     setSaving(false);
   }
@@ -1371,7 +955,6 @@ export default function CathScheduler() {
 
               {editingRules ? (
                 <div style={S.formBox}>
-                  {/* Weekday rules */}
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>📆 平日規則（週一至週五）</div>
                     <div style={S.formRow}>
@@ -1383,7 +966,6 @@ export default function CathScheduler() {
                     </div>
                   </div>
 
-                  {/* Weekend/holiday rules */}
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>🌙 假日／週末規則</div>
                     <div style={S.formRow}>
@@ -1402,7 +984,6 @@ export default function CathScheduler() {
                     </div>
                   </div>
 
-                  {/* Consecutive limit */}
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>🔁 連續值班限制</div>
                     <div style={S.formRow}>
@@ -1425,7 +1006,6 @@ export default function CathScheduler() {
                   </div>
                 </div>
               ) : (
-                // Read-only display
                 <div>
                   <div style={S.ruleSection}>
                     <div style={S.ruleSectionTitle}>📆 平日規則</div>
@@ -1454,7 +1034,6 @@ export default function CathScheduler() {
                 配對的兩位成員在自動排班時會被優先安排在同一天值班。
               </div>
 
-              {/* Add pair form */}
               <div style={{ ...S.formBox, display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
                 <div style={{ flex: 1, minWidth: 120 }}>
                   <div style={S.formLabel}>成員 A</div>
@@ -1553,114 +1132,3 @@ export default function CathScheduler() {
     </div>
   );
 }
-
-// ── Styles ───────────────────────────────────────────────────
-const S = {
-  root: { minHeight: "100vh", background: "#f1f5f9", color: "#0f172a", fontFamily: "'Noto Sans TC', 'Microsoft JhengHei', sans-serif" },
-  toast: { position: "fixed", top: 16, left: "50%", transform: "translateX(-50%)", padding: "10px 24px", borderRadius: 24, color: "#fff", fontWeight: 700, fontSize: 15, zIndex: 999, boxShadow: "0 4px 20px #0003", whiteSpace: "nowrap" },
-  header: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px", background: "#fff", borderBottom: "2px solid #e2e8f0", boxShadow: "0 1px 4px #0001" },
-  headerLeft: { display: "flex", alignItems: "center", gap: 12 },
-  logo: { fontSize: 34, lineHeight: 1 },
-  title: { fontSize: 20, fontWeight: 800, color: "#0891b2" },
-  subtitle: { fontSize: 12, color: "#94a3b8", letterSpacing: 2, textTransform: "uppercase" },
-  headerRight: { display: "flex", alignItems: "center", gap: 8 },
-  savingTxt: { fontSize: 13, color: "#0891b2", fontWeight: 600 },
-  userInfo: { display: "flex", alignItems: "center", gap: 6 },
-  userName: { fontWeight: 700, fontSize: 14, color: "#1e293b" },
-  adminBadge: { fontSize: 10, padding: "1px 6px", borderRadius: 6, background: "#fef3c7", color: "#92400e", fontWeight: 700, border: "1px solid #fde68a" },
-  userBtn: { display: "flex", alignItems: "center", gap: 6, background: "#f0f9ff", border: "1.5px solid #bae6fd", color: "#0369a1", padding: "7px 14px", borderRadius: 20, fontSize: 14, cursor: "pointer", fontWeight: 600 },
-  adminLoginBtn: { display: "flex", alignItems: "center", gap: 4, background: "#fef3c7", border: "1.5px solid #fde68a", color: "#92400e", padding: "7px 14px", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 700 },
-  logoutBtn: { padding: "6px 14px", background: "#f1f5f9", border: "1.5px solid #e2e8f0", color: "#64748b", borderRadius: 20, fontSize: 13, cursor: "pointer", fontWeight: 600 },
-  dot: { borderRadius: "50%", display: "inline-block", flexShrink: 0, width: 10, height: 10 },
-  nav: { display: "flex", gap: 4, padding: "10px 16px", background: "#fff", borderBottom: "1px solid #e2e8f0" },
-  navBtn: { padding: "8px 18px", borderRadius: 20, border: "1.5px solid transparent", background: "transparent", color: "#64748b", cursor: "pointer", fontSize: 14, fontWeight: 600 },
-  navActive: { background: "#e0f2fe", color: "#0891b2", borderColor: "#bae6fd" },
-  monthNav: { display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", background: "#fff", borderBottom: "1px solid #e2e8f0", flexWrap: "wrap" },
-  arrowBtn: { width: 34, height: 34, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#475569", cursor: "pointer", fontSize: 20, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
-  monthLabel: { fontWeight: 800, fontSize: 17, color: "#1e293b", minWidth: 130, textAlign: "center" },
-  genBtn: { marginLeft: "auto", padding: "8px 16px", background: "#0891b2", color: "#fff", border: "none", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14, boxShadow: "0 2px 8px #0891b230" },
-  editToggleBtn: { padding: "8px 16px", background: "#fff", color: "#92400e", border: "1.5px solid #fcd34d", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
-  editToggleBtnActive: { background: "#fef3c7", color: "#92400e", borderColor: "#f59e0b", boxShadow: "0 2px 8px #f59e0b30" },
-  clearBtn: { padding: "8px 14px", background: "#fff", color: "#dc2626", border: "1.5px solid #fca5a5", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
-  regenBtn: { padding: "8px 14px", background: "#fff", color: "#7c3aed", border: "1.5px solid #c4b5fd", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
-  docFillBtn: { padding: "8px 14px", background: "#fff", color: "#16a34a", border: "1.5px solid #86efac", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 14 },
-  reloadBtn: { width: 34, height: 34, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 17, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
-  loadingBar: { height: 3, background: "#e0f2fe", overflow: "hidden" },
-  loadingFill: { height: "100%", width: "60%", background: "#0891b2" },
-  editBanner: { background: "#fffbeb", borderBottom: "1px solid #fcd34d", padding: "8px 16px", fontSize: 13, color: "#92400e", fontWeight: 600 },
-  content: { padding: "8px 10px 48px" }, // overridden inline on mobile
-  calGrid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, marginBottom: 3 },
-  dowHeader: { textAlign: "center", fontSize: 13, padding: "6px 0", fontWeight: 700 },
-  emptyCell: { minHeight: 80 },
-  cell: { background: "#fff", borderRadius: 8, padding: "7px 6px", minHeight: 80, cursor: "pointer", border: "1.5px solid #e2e8f0", transition: "border-color 0.15s, box-shadow 0.15s", position: "relative", overflow: "hidden", boxShadow: "0 1px 2px #0001" },
-  cellWG: { background: "#eff6ff", borderColor: "#bfdbfe" },
-  cellFri: { background: "#fffbeb", borderColor: "#fde68a" },
-  cellHoliday: { background: "#fff1f2", borderColor: "#fecdd3" },
-  cellToday: { borderColor: "#0891b2", boxShadow: "0 0 0 2px #0891b230" },
-  cellSelected: { borderColor: "#0891b2", background: "#e0f2fe" },
-  cellEditMode: { cursor: "default", borderColor: "#fcd34d" },
-  cellDay: { fontSize: 15, fontWeight: 800, lineHeight: 1.2 },
-  cellDow: { fontSize: 10, color: "#94a3b8", marginBottom: 2 },
-  lockIcon: { fontSize: 10, lineHeight: 1 },
-  holidayLabel: { fontSize: 10, color: "#dc2626", fontWeight: 700, background: "#ffe4e6", borderRadius: 4, padding: "1px 4px", display: "inline-block", marginBottom: 2 },
-  cellMembers: { display: "flex", flexWrap: "wrap", gap: 3 },
-  chip: { fontSize: 11, padding: "2px 7px", borderRadius: 8, fontWeight: 600, lineHeight: 1.5, display: "inline-flex", alignItems: "center", gap: 2 },
-  chipEditable: { cursor: "pointer", outline: "none" },
-  chipRemove: { fontSize: 9, opacity: 0.7 },
-  chipAdd: { fontSize: 10, padding: "2px 6px", borderRadius: 8, fontWeight: 600, background: "#f0fdf4", color: "#16a34a", border: "1.5px dashed #86efac", cursor: "pointer", lineHeight: 1.5 },
-  leaveHint: { position: "absolute", top: 4, right: 4, fontSize: 10, color: "#dc2626", fontWeight: 700 },
-  panel: { marginTop: 10, background: "#fff", border: "1.5px solid #bae6fd", borderRadius: 12, padding: "14px 16px", boxShadow: "0 2px 12px #0891b210" },
-  panelHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
-  panelTitle: { fontWeight: 800, fontSize: 16, color: "#0891b2", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
-  panelBadgeWG: { fontSize: 12, background: "#eff6ff", color: "#2563eb", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
-  panelBadgeLock: { fontSize: 12, background: "#fef3c7", color: "#92400e", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
-  panelBadgeHol: { fontSize: 12, background: "#fff1f2", color: "#dc2626", padding: "2px 8px", borderRadius: 10, fontWeight: 600 },
-  panelClose: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" },
-  panelLabel: { fontSize: 13, color: "#64748b", marginBottom: 10, fontWeight: 600 },
-  oncallList: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 4 },
-  oncallCard: { display: "flex", alignItems: "center", justifyContent: "space-between", background: "#f8fafc", borderRadius: 10, padding: "10px 14px", borderLeft: "4px solid #e2e8f0", gap: 10 },
-  oncallCardLeft: { display: "flex", alignItems: "center", gap: 8, flex: 1 },
-  phoneBtn: { display: "inline-flex", alignItems: "center", gap: 4, padding: "7px 14px", borderRadius: 20, border: "1.5px solid", background: "#fff", fontWeight: 700, fontSize: 14, textDecoration: "none", flexShrink: 0, whiteSpace: "nowrap" },
-  memberRow: { display: "flex", flexWrap: "wrap", gap: 8 },
-  memberToggle: { padding: "8px 14px", borderRadius: 20, border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#334155", cursor: "pointer", fontSize: 13, fontWeight: 600, transition: "all 0.15s", display: "flex", alignItems: "center", gap: 5 },
-  memberOnLeave: { opacity: 0.3, cursor: "not-allowed" },
-  leaveNote: { fontSize: 14, color: "#475569", padding: "10px 4px 6px", fontWeight: 500 },
-  statsGrid: { paddingTop: 12, display: "flex", flexDirection: "column", gap: 10 },
-  statCard: { background: "#fff", borderRadius: 10, padding: "14px 18px", position: "relative", overflow: "hidden", display: "flex", alignItems: "center", border: "1.5px solid #e2e8f0", boxShadow: "0 1px 3px #0001" },
-  statBar: { position: "absolute", left: 0, top: 0, bottom: 0, transition: "width 0.5s" },
-  statInfo: { display: "flex", alignItems: "center", gap: 8, flex: 1, position: "relative", flexWrap: "wrap" },
-  statName: { fontWeight: 700, fontSize: 15, color: "#0f172a" },
-  statCount: { fontWeight: 800, fontSize: 18, position: "relative" },
-  statsNote: { textAlign: "center", fontSize: 13, color: "#94a3b8", marginTop: 16 },
-  roleTag: { fontSize: 11, padding: "2px 7px", borderRadius: 6, fontWeight: 600, display: "inline-block" },
-  modalOverlay: { position: "fixed", inset: 0, background: "#00000066", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" },
-  modalBox: { background: "#fff", borderRadius: 16, padding: 24, border: "1px solid #e2e8f0", minWidth: 300, maxWidth: "90vw", boxShadow: "0 8px 32px #0002" },
-  modalTitle: { fontWeight: 800, fontSize: 18, marginBottom: 16, color: "#0891b2" },
-  modalGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
-  memberPickBtn: { padding: "10px 12px", borderRadius: 10, background: "#f8fafc", color: "#1e293b", border: "1.5px solid #e2e8f0", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", transition: "background 0.15s" },
-  pickName: { fontWeight: 700, fontSize: 14, flex: 1 },
-  authInput: { width: "100%", padding: "10px 12px", borderRadius: 8, border: "1.5px solid #cbd5e1", fontSize: 15, outline: "none", boxSizing: "border-box" },
-  authError: { fontSize: 13, color: "#dc2626", background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: 8, padding: "8px 12px" },
-  authHint: { fontSize: 13, color: "#92400e", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 12px", marginBottom: 12 },
-  authSwitchBtn: { background: "none", border: "none", color: "#0891b2", cursor: "pointer", fontSize: 13, textDecoration: "underline", textAlign: "center" },
-  adminTabs: { display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" },
-  adminTabBtn: { padding: "8px 18px", borderRadius: 20, border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#64748b", cursor: "pointer", fontSize: 14, fontWeight: 600 },
-  adminTabActive: { background: "#e0f2fe", color: "#0891b2", borderColor: "#bae6fd" },
-  adminSection: { background: "#fff", borderRadius: 12, padding: 16, border: "1.5px solid #e2e8f0" },
-  sectionTitle: { fontWeight: 800, fontSize: 16, color: "#1e293b", marginBottom: 12 },
-  memberCard: { background: "#f8fafc", borderRadius: 10, padding: "12px 14px", border: "1.5px solid #e2e8f0", marginBottom: 8 },
-  formBox: { background: "#f1f5f9", borderRadius: 10, padding: 14, border: "1.5px solid #e2e8f0", marginBottom: 12 },
-  formRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 8 },
-  formLabel: { fontSize: 13, fontWeight: 600, color: "#475569", minWidth: 44 },
-  formInput: { flex: 1, padding: "7px 10px", borderRadius: 8, border: "1.5px solid #cbd5e1", fontSize: 14, background: "#fff", color: "#1e293b", outline: "none" },
-  formSelect: { flex: 1, padding: "7px 10px", borderRadius: 8, border: "1.5px solid #cbd5e1", fontSize: 14, background: "#fff", color: "#1e293b", outline: "none" },
-  ruleSection: { borderBottom: "1px solid #e2e8f0", marginBottom: 14, paddingBottom: 14 },
-  ruleSectionTitle: { fontWeight: 700, fontSize: 14, color: "#0891b2", marginBottom: 10 },
-  ruleRow: { display: "flex", alignItems: "center", gap: 12, marginBottom: 6 },
-  ruleLabel: { fontSize: 13, color: "#475569", minWidth: 120 },
-  ruleValue: { fontWeight: 700, fontSize: 15, color: "#1e293b" },
-  ruleUnit: { fontSize: 13, color: "#64748b", whiteSpace: "nowrap" },
-  btnPrimary: { padding: "8px 16px", background: "#0891b2", color: "#fff", border: "none", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 13 },
-  btnSecondary: { padding: "8px 16px", background: "#f1f5f9", color: "#475569", border: "1.5px solid #e2e8f0", borderRadius: 20, fontWeight: 600, cursor: "pointer", fontSize: 13 },
-  btnSmall: { padding: "5px 12px", background: "#f8fafc", color: "#334155", border: "1.5px solid #e2e8f0", borderRadius: 16, fontWeight: 600, cursor: "pointer", fontSize: 12 },
-};

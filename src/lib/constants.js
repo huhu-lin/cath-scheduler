@@ -1,0 +1,8 @@
+export const ROLES = ["doctor", "radiologist", "nurse", "other"];
+export const ROLE_LABELS = { doctor: "醫師", radiologist: "放射師", nurse: "護理師", other: "其他" };
+export const ROLE_COLORS = { doctor: "#16a34a", radiologist: "#1d4ed8", nurse: "#dc2626", other: "#64748b" };
+export const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706","#db2777","#0284c7","#9333ea"];
+export const ROLE_ORDER = { doctor: 0, radiologist: 1, nurse: 2, other: 3 };
+export const DEFAULT_RULES = { weekday_rad_nurse: 3, weekend_radiologist: 1, weekend_nurse: 1, max_consecutive: 2 };
+export const DOW_LABELS = ["日","一","二","三","四","五","六"];
+export const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
