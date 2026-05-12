@@ -472,6 +472,10 @@ export default function CathScheduler() {
   const [editingRules, setEditingRules] = useState(null);
   const [rulesSaving, setRulesSaving]   = useState(false);
 
+  // Auto-generate confirm
+  const [showGenConfirm, setShowGenConfirm] = useState(false);
+  const [genConfirmUseRandom, setGenConfirmUseRandom] = useState(false);
+
   // Pairs
   const [pairs, setPairs]             = useState([]);
   const [newPair, setNewPair]         = useState({ a: "", b: "" });
@@ -946,10 +950,10 @@ export default function CathScheduler() {
         }}>›</button>
         {view === "calendar" && isAdmin && (
           <>
-            <button style={S.genBtn} onClick={() => handleAutoGenerate(false)} disabled={saving || loading} title="自動排班">
+            <button style={S.genBtn} onClick={() => { setGenConfirmUseRandom(false); setShowGenConfirm(true); }} disabled={saving || loading} title="自動排班">
               {isMobile ? "⚡" : "⚡ 自動排班"}
             </button>
-            <button style={S.regenBtn} onClick={() => handleAutoGenerate(true)} disabled={saving || loading} title="重新產生一份不同的班表">
+            <button style={S.regenBtn} onClick={() => { setGenConfirmUseRandom(true); setShowGenConfirm(true); }} disabled={saving || loading} title="重新產生一份不同的班表">
               {isMobile ? "🔀" : "🔀 重新排班"}
             </button>
             <button style={S.docFillBtn} onClick={openDoctorFill} disabled={saving || loading} title="填醫師班">
@@ -1118,6 +1122,36 @@ export default function CathScheduler() {
                   </button>
                 );
               })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Auto-generate confirm modal ── */}
+      {showGenConfirm && (
+        <div style={S.modalOverlay} onClick={() => setShowGenConfirm(false)}>
+          <div style={{ ...S.modalBox, maxWidth: 420, width: "94vw" }} onClick={e => e.stopPropagation()}>
+            <div style={S.modalTitle}>
+              {genConfirmUseRandom ? "🔀 確認重新排班" : "⚡ 確認自動排班"}
+            </div>
+            <div style={{ background: "#fef3c7", border: "1.5px solid #fcd34d", borderRadius: 10, padding: "12px 14px", marginBottom: 16, fontSize: 14, color: "#92400e", lineHeight: 1.6 }}>
+              ⚠️ 此操作將覆蓋 <strong>{year} 年 {month + 1} 月</strong> 現有的排班內容（手動鎖定的日期除外）。<br />
+              {Object.values(schedule).some(arr => arr.length > 0)
+                ? `目前已有排班資料，執行後將被新班表取代。`
+                : "目前尚無排班資料，將產生全新班表。"}
+            </div>
+            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 20 }}>
+              {lockedDays.size > 0
+                ? `🔒 已手動鎖定 ${lockedDays.size} 天，這些日期不受影響。`
+                : "目前沒有手動鎖定的日期。"}
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button style={S.btnSecondary} onClick={() => setShowGenConfirm(false)}>取消</button>
+              <button
+                style={{ ...S.btnPrimary, background: genConfirmUseRandom ? "#7c3aed" : "#0891b2" }}
+                onClick={() => { setShowGenConfirm(false); handleAutoGenerate(genConfirmUseRandom); }}>
+                {genConfirmUseRandom ? "🔀 確定重新排班" : "⚡ 確定自動排班"}
+              </button>
             </div>
           </div>
         </div>
