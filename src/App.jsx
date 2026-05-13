@@ -32,23 +32,24 @@ function getStreak(sched, day, memberId, year, month, holidayDays) {
 
 // Sort pool: balance (soft cap at floor(avg)+1) > pair bonus > fewer calls
 // useRandom: add small noise so equal-score members get shuffled differently each run
-function sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, personalCap = null) {
+function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null) {
   const poolAvg = pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0;
   const scores = new Map(pool.map(m => {
     const cap = personalCap ? (personalCap.get(m.id) ?? Math.floor(poolAvg) + 1) : Math.floor(poolAvg) + 1;
     const paired = (pairsMap[m.id] || []).some(pid => selectedIds && selectedIds.has(pid));
+    const avoided = ((avoidMap && avoidMap[m.id]) || []).some(pid => selectedIds && selectedIds.has(pid));
     const overCap = (cnt[m.id] || 0) >= cap ? 100000 : 0;
     const noise = useRandom ? Math.random() * 0.9 : 0;
-    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + overCap + noise];
+    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + (avoided ? 2000 : 0) + overCap + noise];
   }));
   return pool.slice().sort((a, b) => scores.get(a.id) - scores.get(b.id));
 }
 
-function pick(pool, cnt, n, fallback, selectedIds, pairsMap, useRandom, personalCap = null) {
-  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, useRandom, personalCap);
+function pick(pool, cnt, n, fallback, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null) {
+  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap);
   return sorted.length >= n
     ? sorted.slice(0, n)
-    : sortByScore(fallback, cnt, selectedIds, pairsMap, useRandom, personalCap).slice(0, n);
+    : sortByScore(fallback, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap).slice(0, n);
 }
 
 function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom) {
@@ -58,11 +59,17 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
   const cnt = Object.fromEntries(members.map(m => [m.id, 0]));
   const getMember = id => members.find(m => m.id === id);
 
-  // Build pairs lookup: member_id → [partner_ids]
+  // Build pairs lookups: prefer → -500 score, avoid → +2000 score
   const pairsMap = {};
+  const avoidMap = {};
   for (const p of (pairs || [])) {
-    (pairsMap[p.member_id_1] = pairsMap[p.member_id_1] || []).push(p.member_id_2);
-    (pairsMap[p.member_id_2] = pairsMap[p.member_id_2] || []).push(p.member_id_1);
+    if (p.type === 'avoid') {
+      (avoidMap[p.member_id_1] = avoidMap[p.member_id_1] || []).push(p.member_id_2);
+      (avoidMap[p.member_id_2] = avoidMap[p.member_id_2] || []).push(p.member_id_1);
+    } else {
+      (pairsMap[p.member_id_1] = pairsMap[p.member_id_1] || []).push(p.member_id_2);
+      (pairsMap[p.member_id_2] = pairsMap[p.member_id_2] || []).push(p.member_id_1);
+    }
   }
 
   // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team.
@@ -82,10 +89,10 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
     );
     const sel = new Set(), used = new Set(), team = [];
     const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
-      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom);
+      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom);
     rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
     const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), wkndCnt, r.weekend_nurse,
-      availBoth.filter(m => m.role === "nurse"), sel, pairsMap, useRandom);
+      availBoth.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom);
     nurses.forEach(m => { team.push(m.id); });
     // Update wkndCnt so next weekend favours different staff
     team.forEach(id => { if (wkndCnt[id] !== undefined) wkndCnt[id]++; });
@@ -180,27 +187,27 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const needNurse = Math.max(0, r.weekend_nurse - numNurse);
         if (needRad > 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool, cnt, needRad, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool, cnt, needRad, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (needNurse > 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool, cnt, needNurse, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool, cnt, needNurse, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
       } else {
         // Weekday (Mon–Fri): fill to weekday quotas
         if (numRad === 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (numNurse === 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
         const remaining = r.weekday_rad_nurse - currentRN;
         if (remaining > 0) {
           const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible), cnt, remaining, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
         }
       }
       sched[d] = result;
@@ -230,10 +237,10 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         // Fallback: generate independently (e.g. sat was a holiday)
         const used = new Set(result);
         pick(avail.filter(m => m.role === "radiologist" && !used.has(m.id)), cnt, r.weekend_radiologist,
-          avail.filter(m => m.role === "radiologist"), sel, pairsMap, useRandom, personalCap)
+          avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); sel.add(m.id); used.add(m.id); });
         pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)), cnt, r.weekend_nurse,
-          avail.filter(m => m.role === "nurse"), sel, pairsMap, useRandom, personalCap)
+          avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); sel.add(m.id); });
       }
 
@@ -252,17 +259,17 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         (m.role === "radiologist" || m.role === "nurse") &&
         !result.includes(m.id) && eligible(m)
       );
-      pick(extraPool, cnt, 1, extraPool, sel, pairsMap, useRandom, personalCap)
+      pick(extraPool, cnt, 1, extraPool, sel, pairsMap, avoidMap, useRandom, personalCap)
         .forEach(m => { result.push(m.id); sel.add(m.id); });
 
       // Guarantee min 1 rad and 1 nurse on Friday
       if (!result.some(id => getMember(id)?.role === "radiologist")) {
         const fb = avail.filter(m => m.role === "radiologist" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
+        pick(fb, cnt, 1, fb, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
       }
       if (!result.some(id => getMember(id)?.role === "nurse")) {
         const fb = avail.filter(m => m.role === "nurse" && !result.includes(m.id));
-        pick(fb, cnt, 1, fb, sel, pairsMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
+        pick(fb, cnt, 1, fb, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); sel.add(m.id); });
       }
 
       // If no weekend team (Friday at month-end), fill with weekday rad/nurse slots
@@ -275,7 +282,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
         const remaining = r.weekday_rad_nurse - filled;
         if (remaining > 0) {
           const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id) && eligible(m));
-          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap, useRandom, personalCap)
+          pick(rnPool, cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap)
             .forEach(m => { result.push(m.id); sel.add(m.id); });
         }
       }
@@ -287,11 +294,11 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const used = new Set();
 
       const radPool = avail.filter(m => m.role === "radiologist" && !used.has(m.id));
-      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, useRandom, personalCap)
+      pick(radPool.filter(eligible), cnt, 1, radPool, sel, pairsMap, avoidMap, useRandom, personalCap)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const nursePool = avail.filter(m => m.role === "nurse" && !used.has(m.id));
-      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap, useRandom, personalCap)
+      pick(nursePool.filter(eligible), cnt, 1, nursePool, sel, pairsMap, avoidMap, useRandom, personalCap)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
 
       const filled = result.filter(id => {
@@ -301,7 +308,7 @@ function autoGenerate(year, month, members, leave, existingSched, lockedDays, ho
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, useRandom, personalCap)
+        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
     }
@@ -385,6 +392,7 @@ async function dbFetchPairs() {
 
 // ── Constants ───────────────────────────────────────────────
 const DOW_LABELS = ["日","一","二","三","四","五","六"];
+const DOW_LABELS_MON = ["一","二","三","四","五","六","日"];
 const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
 
 // ── MemberForm ───────────────────────────────────────────────
@@ -479,6 +487,7 @@ export default function CathScheduler() {
   // Pairs
   const [pairs, setPairs]             = useState([]);
   const [newPair, setNewPair]         = useState({ a: "", b: "" });
+  const [newAvoidPair, setNewAvoidPair] = useState({ a: "", b: "" });
   const [pairSaving, setPairSaving]   = useState(false);
 
   const isAdmin = !!session && (currentUser?.is_admin ?? false);
@@ -791,21 +800,23 @@ export default function CathScheduler() {
   }
 
   // ── Pair CRUD ────────────────────────────────────────────────
-  async function addPair() {
-    const { a, b } = newPair;
+  async function addPair(type = 'prefer') {
+    const src = type === 'avoid' ? newAvoidPair : newPair;
+    const { a, b } = src;
     if (!a || !b || a === b) { notify("請選擇兩位不同的成員", "err"); return; }
     const id1 = a < b ? a : b;
     const id2 = a < b ? b : a;
-    if (pairs.some(p => p.member_id_1 === id1 && p.member_id_2 === id2)) {
+    if (pairs.some(p => p.member_id_1 === id1 && p.member_id_2 === id2 && p.type === type)) {
       notify("此配對已存在", "err"); return;
     }
     setPairSaving(true);
     try {
       const { data, error } = await supabase.from("member_pairs")
-        .insert({ member_id_1: id1, member_id_2: id2 }).select().single();
+        .insert({ member_id_1: id1, member_id_2: id2, type }).select().single();
       if (error) throw error;
       setPairs(prev => [...prev, data]);
-      setNewPair({ a: "", b: "" });
+      if (type === 'avoid') setNewAvoidPair({ a: "", b: "" });
+      else setNewPair({ a: "", b: "" });
       notify("✅ 配對已新增");
     } catch (e) { notify("❌ 新增失敗：" + e.message, "err"); }
     setPairSaving(false);
@@ -826,8 +837,9 @@ export default function CathScheduler() {
   function buildCalendar() {
     const days = getDaysInMonth(year, month);
     const firstDow = getDow(year, month, 1);
+    const firstCol = (firstDow + 6) % 7; // Monday-first: Mon=0, ..., Sun=6
     const cells = [];
-    for (let i = 0; i < firstDow; i++) cells.push(null);
+    for (let i = 0; i < firstCol; i++) cells.push(null);
     for (let d = 1; d <= days; d++) cells.push(d);
     return cells;
   }
@@ -927,7 +939,7 @@ export default function CathScheduler() {
 
       {/* Nav */}
       <nav style={S.nav}>
-        {[["calendar","📅 班表"],["leave","🙋 預假"],["stats","📊 統計"]].map(([v, l]) => (
+        {[["calendar","📅 班表"],["leave","🙋 預假"],["stats","📊 統計"],["help","📖 說明"]].map(([v, l]) => (
           <button key={v} style={{ ...S.navBtn, ...(view === v ? S.navActive : {}) }}
             onClick={() => { setView(v); setSelectedDay(null); setEditMode(false); }}>{l}</button>
         ))}
@@ -981,8 +993,8 @@ export default function CathScheduler() {
       {view === "calendar" && (
         <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.calGrid}>
-            {DOW_LABELS.map((d, i) => (
-              <div key={d} style={{ ...S.dowHeader, color: i === 0 ? "#dc2626" : i === 6 ? "#2563eb" : "#64748b" }}>{d}</div>
+            {DOW_LABELS_MON.map((d, i) => (
+              <div key={d} style={{ ...S.dowHeader, color: i === 6 ? "#dc2626" : i === 5 ? "#2563eb" : "#64748b" }}>{d}</div>
             ))}
           </div>
           <div style={S.calGrid}>
@@ -1201,8 +1213,8 @@ export default function CathScheduler() {
             {isAdmin ? "管理員模式：可幫任何人預假／取消" : currentUser ? `身份：${currentUser.name}　點擊自己的名字來預假 / 取消` : "⬆ 請先點右上角「選擇身份」，再操作預假"}
           </div>
           <div style={S.calGrid}>
-            {DOW_LABELS.map((d, i) => (
-              <div key={d} style={{ ...S.dowHeader, color: i === 0 ? "#dc2626" : i === 6 ? "#2563eb" : "#64748b" }}>{d}</div>
+            {DOW_LABELS_MON.map((d, i) => (
+              <div key={d} style={{ ...S.dowHeader, color: i === 6 ? "#dc2626" : i === 5 ? "#2563eb" : "#64748b" }}>{d}</div>
             ))}
           </div>
           <div style={S.calGrid}>
@@ -1281,6 +1293,82 @@ export default function CathScheduler() {
         </div>
       )}
 
+      {/* ── Help / Manual ── */}
+      {view === "help" && (
+        <div style={{ ...S.content, padding: isMobile ? "10px 10px 60px" : "16px 20px 48px", maxWidth: 680, margin: "0 auto" }}>
+          <div style={{ fontWeight: 800, fontSize: 20, color: "#0891b2", marginBottom: 4 }}>📖 使用說明</div>
+          <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 20 }}>心導管室 On-Call 排班系統</div>
+
+          {[
+            {
+              icon: "📅", title: "班表頁面",
+              items: [
+                "首頁顯示當月每天的 On-Call 人員。",
+                "點擊日期格子可查看當日詳細人員資訊及聯絡電話。",
+                "🌙 藍色格為週末，⭐ 黃色格為週五，🎌 粉色格為國定假日。",
+                "🔒 鎖頭圖示代表該日已手動設定，不受自動排班影響。",
+                "格子右上角「休 N」表示當天有 N 人請假。",
+              ]
+            },
+            {
+              icon: "🙋", title: "預假頁面",
+              items: [
+                "點擊右上角「選擇身份」選取自己的姓名。",
+                "切換至「🙋 預假」頁，點擊日期格子中自己的名字即可預假或取消。",
+                "預假成功後名字會變成紅色並顯示 🚫。",
+                "管理員可幫任何人操作預假。",
+                "桌面版：直接在格子內點名字；手機版：先點日期格再從清單選取。",
+              ]
+            },
+            {
+              icon: "📊", title: "統計頁面",
+              items: [
+                "顯示本月每位成員的值班次數。",
+                "橫向進度條反映相對班次比例。",
+                "底部顯示全體平均值班次數。",
+              ]
+            },
+            {
+              icon: "🔐", title: "管理員登入",
+              items: [
+                "點擊右上角「🔐 管理員登入」輸入帳號密碼。",
+                "管理員帳號由系統管理員預先建立，對應成員的 Email 欄位。",
+                "登入後可進入「⚙️ 管理」頁面，並使用排班相關操作。",
+              ]
+            },
+            {
+              icon: "⚡", title: "自動排班（管理員）",
+              items: [
+                "「⚡ 自動排班」依照排班規則與人員設定自動填入班表。",
+                "「🔀 重新排班」以隨機排列產生不同分配結果（同等條件下）。",
+                "「👨‍⚕️ 填醫師班」逐日選擇值班醫師，儲存後鎖定不受自動排班影響。",
+                "「✏️ 手動調整」進入編輯模式，可逐一新增或移除日期內的人員。",
+                "「🗑️ 清除」刪除當月所有排班（包含手動鎖定）。",
+                "🔒 手動鎖定的日期在執行自動排班時不會被覆蓋。",
+              ]
+            },
+            {
+              icon: "⚙️", title: "管理頁面（管理員）",
+              items: [
+                "👥 人員管理：新增、編輯、刪除成員；設定職類、電話、Email 及管理員權限。",
+                "📋 排班規則：設定平日與週末的人員配額，以及最長連續值班天數。",
+                "🔗 配對規則：偏好配對讓兩人優先同天值班；避免配對讓兩人盡量不同天。",
+                "🎌 國定假日：設定本年度國定假日，假日當天不自動排班。",
+              ]
+            },
+          ].map(({ icon, title, items }) => (
+            <div key={title} style={{ background: "#fff", borderRadius: 12, padding: "14px 18px", marginBottom: 12, border: "1.5px solid #e2e8f0", boxShadow: "0 1px 3px #0001" }}>
+              <div style={{ fontWeight: 800, fontSize: 15, color: "#1e293b", marginBottom: 10 }}>{icon} {title}</div>
+              <ul style={{ margin: 0, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 5 }}>
+                {items.map((item, i) => (
+                  <li key={i} style={{ fontSize: 13, color: "#475569", lineHeight: 1.6 }}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* ── Stats ── */}
       {view === "stats" && (
         <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
@@ -1312,7 +1400,7 @@ export default function CathScheduler() {
       {view === "admin" && isAdmin && (
         <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.adminTabs}>
-            {[["members","👥 人員管理"],["rules","📋 排班規則"],["pairs","🤝 偏好配對"],["holidays","🎌 國定假日"]].map(([t, l]) => (
+            {[["members","👥 人員管理"],["rules","📋 排班規則"],["pairs","🔗 配對規則"],["holidays","🎌 國定假日"]].map(([t, l]) => (
               <button key={t} style={{ ...S.adminTabBtn, ...(adminTab === t ? S.adminTabActive : {}) }}
                 onClick={() => setAdminTab(t)}>{l}</button>
             ))}
@@ -1449,57 +1537,98 @@ export default function CathScheduler() {
           {/* Pairs tab */}
           {adminTab === "pairs" && (
             <div style={S.adminSection}>
-              <div style={S.sectionTitle}>偏好配對設定</div>
+              {/* ── Prefer pairs ── */}
+              <div style={S.sectionTitle}>🤝 偏好配對</div>
               <div style={{ fontSize: 13, color: "#64748b", marginBottom: 14 }}>
                 配對的兩位成員在自動排班時會被優先安排在同一天值班。
               </div>
-
-              {/* Add pair form */}
               <div style={{ ...S.formBox, display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
                 <div style={{ flex: 1, minWidth: 120 }}>
                   <div style={S.formLabel}>成員 A</div>
                   <select style={S.formSelect} value={newPair.a}
                     onChange={e => setNewPair(p => ({ ...p, a: e.target.value }))}>
                     <option value="">— 選擇 —</option>
-                    {members.map(m => (
-                      <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>
-                    ))}
+                    {members.map(m => <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>)}
                   </select>
                 </div>
-                <div style={{ fontSize: 20, paddingBottom: 6, color: "#94a3b8" }}>↔</div>
+                <div style={{ fontSize: 20, paddingBottom: 6, color: "#16a34a" }}>🤝</div>
                 <div style={{ flex: 1, minWidth: 120 }}>
                   <div style={S.formLabel}>成員 B</div>
                   <select style={S.formSelect} value={newPair.b}
                     onChange={e => setNewPair(p => ({ ...p, b: e.target.value }))}>
                     <option value="">— 選擇 —</option>
-                    {members.filter(m => m.id !== newPair.a).map(m => (
-                      <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>
-                    ))}
+                    {members.filter(m => m.id !== newPair.a).map(m => <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>)}
                   </select>
                 </div>
-                <button style={S.btnPrimary} onClick={addPair} disabled={pairSaving || !newPair.a || !newPair.b}>
-                  {pairSaving ? "新增中…" : "+ 新增配對"}
+                <button style={S.btnPrimary} onClick={() => addPair('prefer')} disabled={pairSaving || !newPair.a || !newPair.b}>
+                  {pairSaving ? "新增中…" : "+ 新增"}
                 </button>
               </div>
-
-              {pairs.length === 0 && (
-                <div style={{ color: "#94a3b8", fontSize: 14, padding: "12px 0" }}>尚未設定任何偏好配對</div>
+              {pairs.filter(p => p.type !== 'avoid').length === 0 && (
+                <div style={{ color: "#94a3b8", fontSize: 14, padding: "8px 0 12px" }}>尚未設定偏好配對</div>
               )}
-              {pairs.map(p => {
+              {pairs.filter(p => p.type !== 'avoid').map(p => {
                 const m1 = getMember(p.member_id_1);
                 const m2 = getMember(p.member_id_2);
                 if (!m1 || !m2) return null;
                 return (
-                  <div key={p.id} style={{ ...S.memberCard, display: "flex", alignItems: "center", gap: 12 }}>
+                  <div key={p.id} style={{ ...S.memberCard, display: "flex", alignItems: "center", gap: 10, borderColor: "#86efac" }}>
                     <span style={{ ...S.dot, background: ROLE_COLORS[m1.role], width: 10, height: 10 }} />
                     <span style={{ fontWeight: 700, fontSize: 14 }}>{m1.name}</span>
                     <span style={{ ...S.roleTag, background: ROLE_COLORS[m1.role] + "18", color: ROLE_COLORS[m1.role] }}>{ROLE_LABELS[m1.role]}</span>
-                    <span style={{ color: "#94a3b8", fontSize: 18 }}>↔</span>
+                    <span style={{ color: "#16a34a", fontSize: 16 }}>🤝</span>
                     <span style={{ ...S.dot, background: ROLE_COLORS[m2.role], width: 10, height: 10 }} />
                     <span style={{ fontWeight: 700, fontSize: 14 }}>{m2.name}</span>
                     <span style={{ ...S.roleTag, background: ROLE_COLORS[m2.role] + "18", color: ROLE_COLORS[m2.role] }}>{ROLE_LABELS[m2.role]}</span>
-                    <button style={{ ...S.btnSmall, marginLeft: "auto", color: "#dc2626", borderColor: "#fca5a5" }}
-                      onClick={() => deletePair(p.id)}>刪除</button>
+                    <button style={{ ...S.btnSmall, marginLeft: "auto", color: "#dc2626", borderColor: "#fca5a5" }} onClick={() => deletePair(p.id)}>刪除</button>
+                  </div>
+                );
+              })}
+
+              {/* ── Avoid pairs ── */}
+              <div style={{ ...S.sectionTitle, marginTop: 24, paddingTop: 20, borderTop: "1px solid #e2e8f0" }}>🚫 避免配對</div>
+              <div style={{ fontSize: 13, color: "#64748b", marginBottom: 14 }}>
+                設定後，自動排班會盡量避免這兩位成員在同一天值班。
+              </div>
+              <div style={{ ...S.formBox, display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap", borderColor: "#fca5a5" }}>
+                <div style={{ flex: 1, minWidth: 120 }}>
+                  <div style={S.formLabel}>成員 A</div>
+                  <select style={S.formSelect} value={newAvoidPair.a}
+                    onChange={e => setNewAvoidPair(p => ({ ...p, a: e.target.value }))}>
+                    <option value="">— 選擇 —</option>
+                    {members.map(m => <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>)}
+                  </select>
+                </div>
+                <div style={{ fontSize: 20, paddingBottom: 6, color: "#dc2626" }}>🚫</div>
+                <div style={{ flex: 1, minWidth: 120 }}>
+                  <div style={S.formLabel}>成員 B</div>
+                  <select style={S.formSelect} value={newAvoidPair.b}
+                    onChange={e => setNewAvoidPair(p => ({ ...p, b: e.target.value }))}>
+                    <option value="">— 選擇 —</option>
+                    {members.filter(m => m.id !== newAvoidPair.a).map(m => <option key={m.id} value={m.id}>{m.name}（{ROLE_LABELS[m.role]}）</option>)}
+                  </select>
+                </div>
+                <button style={{ ...S.btnPrimary, background: "#dc2626" }} onClick={() => addPair('avoid')} disabled={pairSaving || !newAvoidPair.a || !newAvoidPair.b}>
+                  {pairSaving ? "新增中…" : "+ 新增"}
+                </button>
+              </div>
+              {pairs.filter(p => p.type === 'avoid').length === 0 && (
+                <div style={{ color: "#94a3b8", fontSize: 14, padding: "8px 0 12px" }}>尚未設定避免配對</div>
+              )}
+              {pairs.filter(p => p.type === 'avoid').map(p => {
+                const m1 = getMember(p.member_id_1);
+                const m2 = getMember(p.member_id_2);
+                if (!m1 || !m2) return null;
+                return (
+                  <div key={p.id} style={{ ...S.memberCard, display: "flex", alignItems: "center", gap: 10, borderColor: "#fca5a5" }}>
+                    <span style={{ ...S.dot, background: ROLE_COLORS[m1.role], width: 10, height: 10 }} />
+                    <span style={{ fontWeight: 700, fontSize: 14 }}>{m1.name}</span>
+                    <span style={{ ...S.roleTag, background: ROLE_COLORS[m1.role] + "18", color: ROLE_COLORS[m1.role] }}>{ROLE_LABELS[m1.role]}</span>
+                    <span style={{ color: "#dc2626", fontSize: 16 }}>🚫</span>
+                    <span style={{ ...S.dot, background: ROLE_COLORS[m2.role], width: 10, height: 10 }} />
+                    <span style={{ fontWeight: 700, fontSize: 14 }}>{m2.name}</span>
+                    <span style={{ ...S.roleTag, background: ROLE_COLORS[m2.role] + "18", color: ROLE_COLORS[m2.role] }}>{ROLE_LABELS[m2.role]}</span>
+                    <button style={{ ...S.btnSmall, marginLeft: "auto", color: "#dc2626", borderColor: "#fca5a5" }} onClick={() => deletePair(p.id)}>刪除</button>
                   </div>
                 );
               })}
@@ -1636,6 +1765,8 @@ const S = {
   modalOverlay: { position: "fixed", inset: 0, background: "#00000066", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" },
   modalBox: { background: "#fff", borderRadius: 16, padding: 24, border: "1px solid #e2e8f0", minWidth: 300, maxWidth: "90vw", boxShadow: "0 8px 32px #0002" },
   modalTitle: { fontWeight: 800, fontSize: 18, marginBottom: 16, color: "#0891b2" },
+  modalHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
+  modalClose: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" },
   modalGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
   memberPickBtn: { padding: "10px 12px", borderRadius: 10, background: "#f8fafc", color: "#1e293b", border: "1.5px solid #e2e8f0", cursor: "pointer", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", transition: "background 0.15s" },
   pickName: { fontWeight: 700, fontSize: 14, flex: 1 },
