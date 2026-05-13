@@ -5,4 +5,5 @@ export const DEFAULT_COLORS = ["#0891b2","#7c3aed","#dc2626","#16a34a","#d97706"
 export const ROLE_ORDER = { doctor: 0, radiologist: 1, nurse: 2, other: 3 };
 export const DEFAULT_RULES = { weekday_rad_nurse: 3, weekend_radiologist: 1, weekend_nurse: 1, max_consecutive: 2 };
 export const DOW_LABELS = ["日","一","二","三","四","五","六"];
+export const DOW_LABELS_MON = ["一","二","三","四","五","六","日"];
 export const MONTH_NAMES = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];

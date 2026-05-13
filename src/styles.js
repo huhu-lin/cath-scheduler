@@ -108,4 +108,6 @@ export const S = {
   btnPrimary: { padding: "8px 16px", background: "#0891b2", color: "#fff", border: "none", borderRadius: 20, fontWeight: 700, cursor: "pointer", fontSize: 13 },
   btnSecondary: { padding: "8px 16px", background: "#f1f5f9", color: "#475569", border: "1.5px solid #e2e8f0", borderRadius: 20, fontWeight: 600, cursor: "pointer", fontSize: 13 },
   btnSmall: { padding: "5px 12px", background: "#f8fafc", color: "#334155", border: "1.5px solid #e2e8f0", borderRadius: 16, fontWeight: 600, cursor: "pointer", fontSize: 12 },
+  modalHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
+  modalClose: { width: 28, height: 28, borderRadius: "50%", border: "1.5px solid #e2e8f0", background: "#f8fafc", color: "#94a3b8", cursor: "pointer", fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center" },
 };
