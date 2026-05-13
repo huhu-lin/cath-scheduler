@@ -424,7 +424,8 @@ export default function CathScheduler() {
   const isToday = d => d === today.getDate() && month === today.getMonth() && year === today.getFullYear();
 
   const callCount = {};
-  members.forEach(m => { callCount[m.id] = 0; });
+  members.filter(m => m.role === "radiologist" || m.role === "nurse")
+    .forEach(m => { callCount[m.id] = 0; });
   Object.values(schedule).forEach(ids => ids.forEach(id => { if (callCount[id] !== undefined) callCount[id]++; }));
 
   const holidayMap = {};
@@ -911,7 +912,7 @@ export default function CathScheduler() {
       {view === "stats" && (
         <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
           <div style={S.statsGrid}>
-            {members.map(mbr => {
+            {members.filter(m => m.role === "radiologist" || m.role === "nurse").map(mbr => {
               const cnt = callCount[mbr.id] || 0;
               const max = Math.max(...Object.values(callCount), 1);
               return (
@@ -928,8 +929,8 @@ export default function CathScheduler() {
             })}
           </div>
           <div style={S.statsNote}>
-            本月平均：{members.length > 0
-              ? (Object.values(callCount).reduce((a, b) => a + b, 0) / members.length).toFixed(1) : 0} 次／人
+            本月平均：{Object.keys(callCount).length > 0
+              ? (Object.values(callCount).reduce((a, b) => a + b, 0) / Object.keys(callCount).length).toFixed(1) : 0} 次／人
           </div>
         </div>
       )}
