@@ -5,6 +5,14 @@ export function getDow(y, m, d) { return new Date(y, m, d).getDay(); }
 export function isWeekend(dow) { return dow === 0 || dow === 6; }
 export function isFriday(dow) { return dow === 5; }
 
+// Returns the day-of-month of the Monday of the Mon–Sun calendar week containing day d.
+// May be ≤0 for the first partial week; used only as a map key.
+function getWeekKey(y, m, d) {
+  const dow = getDow(y, m, d);
+  const daysSinceMon = dow === 0 ? 6 : dow - 1;
+  return d - daysSinceMon;
+}
+
 // Consecutive weekday streak — weekends and national holidays break/reset the streak
 function getStreak(sched, day, memberId, year, month, holidayDays) {
   let s = 0;
@@ -19,7 +27,7 @@ function getStreak(sched, day, memberId, year, month, holidayDays) {
 
 // Sort pool: balance (soft cap at floor(avg)+1) > pair bonus > fewer calls
 // useRandom: add small noise so equal-score members get shuffled differently each run
-function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null) {
+function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null, weekCntMap = null) {
   const poolAvg = pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0;
   const scores = new Map(pool.map(m => {
     const cap = personalCap ? (personalCap.get(m.id) ?? Math.floor(poolAvg) + 1) : Math.floor(poolAvg) + 1;
@@ -27,16 +35,17 @@ function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, pers
     const avoided = ((avoidMap && avoidMap[m.id]) || []).some(pid => selectedIds && selectedIds.has(pid));
     const overCap = (cnt[m.id] || 0) >= cap ? 100000 : 0;
     const noise = useRandom ? Math.random() * 0.9 : 0;
-    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + (avoided ? 2000 : 0) + overCap + noise];
+    const weekPenalty = weekCntMap ? (weekCntMap[m.id] || 0) * 10 : 0;
+    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + (avoided ? 2000 : 0) + overCap + weekPenalty + noise];
   }));
   return pool.slice().sort((a, b) => scores.get(a.id) - scores.get(b.id));
 }
 
-function pick(pool, cnt, n, fallback, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null) {
-  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap);
+function pick(pool, cnt, n, fallback, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null, weekCntMap = null) {
+  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap, weekCntMap);
   return sorted.length >= n
     ? sorted.slice(0, n)
-    : sortByScore(fallback, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap).slice(0, n);
+    : sortByScore(fallback, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap, weekCntMap).slice(0, n);
 }
 
 export function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom) {
@@ -105,6 +114,24 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       daysWorked += 1;
     }
     team.forEach(id => { if (cnt[id] !== undefined) cnt[id] += daysWorked; });
+  }
+
+  // Pre-seed weekCnt with the same Fri+Sat+Sun blocks so within-week weekday
+  // selection deprioritises staff who already have weekend duties that week.
+  const weekCnt = {};
+  for (let d = 1; d <= days; d++) {
+    if (getDow(year, month, d) !== 6) continue;
+    if (lockedDays && lockedDays.has(d)) continue;
+    const team = weekendNonDocTeam[d] || [];
+    const sat = d, sun = d + 1, fri = d - 1;
+    const satKey = getWeekKey(year, month, sat); // Fri/Sat/Sun share the same Mon–Sun week key
+    if (!weekCnt[satKey]) weekCnt[satKey] = {};
+    let preSeededCount = 1; // Saturday
+    if (sun <= days) preSeededCount++;
+    if (fri >= 1 && !isWeekend(getDow(year, month, fri)) &&
+        !(lockedDays && lockedDays.has(fri)) &&
+        !(holidayDays && holidayDays.has(fri))) preSeededCount++;
+    team.forEach(id => { weekCnt[satKey][id] = (weekCnt[satKey][id] || 0) + preSeededCount; });
   }
 
   // Pre-seed cnt with all locked-day manual assignments so that auto-assigned
@@ -242,8 +269,9 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       const filled = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
+        const currentWeekCnt = weekCnt[getWeekKey(year, month, d)] || {};
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap)
+        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
       sched[d] = result;
@@ -253,38 +281,60 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       const sel = new Set();
       const result = [];
       const used = new Set();
+      const currentWeekCnt = weekCnt[getWeekKey(year, month, d)] || {};
+
+      // For Monday: exclude members who worked the preceding weekend (Sat/Sun)
+      // to prevent cross-week consecutive shifts.
+      const prevWknd = new Set();
+      if (dow === 1) {
+        if (d - 1 >= 1) (sched[d-1] || []).forEach(id => prevWknd.add(id));
+        if (d - 2 >= 1) (sched[d-2] || []).forEach(id => prevWknd.add(id));
+      }
+      const eligMon = m => eligible(m) && !prevWknd.has(m.id);
+
       // Ensure at least 1 rad and 1 nurse before filling to quota
-      pick(avail.filter(m => m.role === "radiologist").filter(eligible), cnt, 1,
-        avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap)
+      pick(avail.filter(m => m.role === "radiologist").filter(eligMon), cnt, 1,
+        avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-      pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)).filter(eligible), cnt, 1,
-        avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap)
+      pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)).filter(eligMon), cnt, 1,
+        avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       const filled = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap)
+        pick(rnPool.filter(eligMon), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
       sched[d] = result;
     }
 
     const result = sched[d];
+    const wkKey = getWeekKey(year, month, d);
+    if (!weekCnt[wkKey]) weekCnt[wkKey] = {};
     if (isWeekend(dow)) {
       // Weekend team was pre-seeded (Fri+Sat+Sun block); don't double-count.
       const satDay = dow === 6 ? d : d - 1;
       const preSeededSet = new Set(weekendNonDocTeam[satDay] || []);
-      result.forEach(id => { if (!preSeededSet.has(id) && cnt[id] !== undefined) cnt[id]++; });
+      result.forEach(id => {
+        if (!preSeededSet.has(id) && cnt[id] !== undefined) cnt[id]++;
+        if (!preSeededSet.has(id)) weekCnt[wkKey][id] = (weekCnt[wkKey][id] || 0) + 1;
+      });
     } else if (isFriday(dow)) {
       // Friday uses next weekend's team; only skip increment if that Sat was pre-seeded
       // (i.e. it's not locked — locked weekends aren't in weekendNonDocTeam pre-seed).
       const satDay = d + 1;
       const nextSatPreseeded = satDay <= days && !(lockedDays && lockedDays.has(satDay));
       const preSeededFriSet = nextSatPreseeded ? new Set(weekendNonDocTeam[satDay] || []) : new Set();
-      result.forEach(id => { if (!preSeededFriSet.has(id) && cnt[id] !== undefined) cnt[id]++; });
+      result.forEach(id => {
+        if (!preSeededFriSet.has(id) && cnt[id] !== undefined) cnt[id]++;
+        if (!preSeededFriSet.has(id)) weekCnt[wkKey][id] = (weekCnt[wkKey][id] || 0) + 1;
+      });
     } else {
-      result.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
+      result.forEach(id => {
+        if (cnt[id] !== undefined) cnt[id]++;
+        weekCnt[wkKey][id] = (weekCnt[wkKey][id] || 0) + 1;
+      });
     }
   }
   return sched;
