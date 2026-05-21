@@ -41,6 +41,7 @@ export const S = {
   cellHoliday: { background: "#fff1f2", borderColor: "#fecdd3" },
   cellToday: { borderColor: "#0891b2", boxShadow: "0 0 0 2px #0891b230" },
   cellSelected: { borderColor: "#0891b2", background: "#e0f2fe" },
+  cellWeekday: { border: "1.5px solid #1e293b", background: "#fff" },
   cellEditMode: { cursor: "default", borderColor: "#fcd34d" },
   cellDay: { fontSize: 15, fontWeight: 800, lineHeight: 1.2 },
   cellDow: { fontSize: 10, color: "#94a3b8", marginBottom: 2 },
