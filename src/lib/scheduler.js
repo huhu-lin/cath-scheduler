@@ -24,8 +24,8 @@ function getStreak(sched, day, memberId) {
 }
 
 // Sort pool: balance (soft cap at floor(avg)+1) > pair bonus > fewer calls
-// useRandom: add small noise so equal-score members get shuffled differently each run
-function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null, weekCntMap = null) {
+// firstWeekendSet: members who haven't had any weekend yet — gets -5000 priority boost
+function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null, weekCntMap = null, firstWeekendSet = null) {
   const poolAvg = pool.length > 0 ? pool.reduce((s, m) => s + (cnt[m.id] || 0), 0) / pool.length : 0;
   const scores = new Map(pool.map(m => {
     const cap = personalCap ? (personalCap.get(m.id) ?? Math.floor(poolAvg) + 1) : Math.floor(poolAvg) + 1;
@@ -34,16 +34,17 @@ function sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, pers
     const overCap = (cnt[m.id] || 0) >= cap ? 100000 : 0;
     const noise = useRandom ? Math.random() * 0.9 : 0;
     const weekPenalty = weekCntMap ? (weekCntMap[m.id] || 0) * 10 : 0;
-    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + (avoided ? 2000 : 0) + overCap + weekPenalty + noise];
+    const firstBonus = (firstWeekendSet && firstWeekendSet.has(m.id)) ? -5000 : 0;
+    return [m.id, (cnt[m.id] || 0) - (paired ? 500 : 0) + (avoided ? 2000 : 0) + overCap + weekPenalty + noise + firstBonus];
   }));
   return pool.slice().sort((a, b) => scores.get(a.id) - scores.get(b.id));
 }
 
-function pick(pool, cnt, n, fallback, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null, weekCntMap = null) {
-  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap, weekCntMap);
+function pick(pool, cnt, n, fallback, selectedIds, pairsMap, avoidMap, useRandom, personalCap = null, weekCntMap = null, firstWeekendSet = null) {
+  const sorted = sortByScore(pool, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap, weekCntMap, firstWeekendSet);
   return sorted.length >= n
     ? sorted.slice(0, n)
-    : sortByScore(fallback, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap, weekCntMap).slice(0, n);
+    : sortByScore(fallback, cnt, selectedIds, pairsMap, avoidMap, useRandom, personalCap, weekCntMap, firstWeekendSet).slice(0, n);
 }
 
 export function autoGenerate(year, month, members, leave, existingSched, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom) {
@@ -66,11 +67,6 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
     }
   }
 
-  // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team.
-  // Use a dedicated counter so successive weekends rotate to different staff.
-  const weekendNonDocTeam = {}; // satDay → [memberId, ...]
-  const wkndCnt = Object.fromEntries(members.map(m => [m.id, 0]));
-
   // Strict radiologist cap: each rad gets at most ceil(numSaturdays / numRads) weekends.
   // With 4 rads & 4 weekends → cap=1 (no rad doubles); with 4 rads & 5 weekends → cap=2.
   const allRads = members.filter(m => m.role === "radiologist");
@@ -78,6 +74,28 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   for (let d = 1; d <= days; d++) if (getDow(year, month, d) === 6) numSats++;
   const wkndRadCapVal = allRads.length > 0 ? Math.ceil(numSats / allRads.length) : 1;
   const wkndRadCap = new Map(allRads.map(m => [m.id, wkndRadCapVal]));
+
+  // When the month has exactly 4 Saturdays, one nurse is exempt from all weekends.
+  // The exempt slot rotates by month index (month % numNurses) so each nurse gets a
+  // rest in turn across months.
+  const allNursesSorted = members.filter(m => m.role === "nurse")
+    .sort((a, b) => (a.sort_order ?? 9999) - (b.sort_order ?? 9999));
+  let exemptNurseId = null;
+  if (numSats === 4 && allNursesSorted.length > 0) {
+    exemptNurseId = allNursesSorted[month % allNursesSorted.length].id;
+  }
+
+  // Every radiologist and every non-exempt nurse must work ≥1 weekend (Fri/Sat/Sun block).
+  const needsWeekendSet = new Set([
+    ...allRads.map(m => m.id),
+    ...allNursesSorted.filter(m => m.id !== exemptNurseId).map(m => m.id),
+  ]);
+
+  // Pre-pass: for each Saturday in month, compute the shared non-doctor weekend team.
+  // Use a dedicated counter so successive weekends rotate to different staff.
+  const weekendNonDocTeam = {}; // satDay → [memberId, ...]
+  const wkndCnt = Object.fromEntries(members.map(m => [m.id, 0]));
+  const assignedToWeekend = new Set(); // tracks who has ≥1 weekend assignment
 
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue; // only Saturdays
@@ -90,16 +108,60 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       !satLv.includes(m.id) &&
       (sun > days || !sunLv.includes(m.id))
     );
+
+    // Priority set: members who still need their first weekend assignment
+    const firstWkndSet = new Set([...needsWeekendSet].filter(id => !assignedToWeekend.has(id)));
+
     const sel = new Set(), used = new Set(), team = [];
     const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
-      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, wkndRadCap);
-    rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
-    const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), wkndCnt, r.weekend_nurse,
-      availBoth.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom);
-    nurses.forEach(m => { team.push(m.id); });
+      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, wkndRadCap, null, firstWkndSet);
+    rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); assignedToWeekend.add(m.id); });
+
+    // Exempt nurse is excluded from the weekend nurse pool entirely
+    const nursePool = availBoth.filter(m => m.role === "nurse" && !used.has(m.id) && m.id !== exemptNurseId);
+    const nurseFallback = availBoth.filter(m => m.role === "nurse" && m.id !== exemptNurseId);
+    const nurses = pick(nursePool, wkndCnt, r.weekend_nurse, nurseFallback, sel, pairsMap, avoidMap, useRandom, null, null, firstWkndSet);
+    nurses.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); assignedToWeekend.add(m.id); });
+
     // Update wkndCnt so next weekend favours different staff
     team.forEach(id => { if (wkndCnt[id] !== undefined) wkndCnt[id]++; });
     weekendNonDocTeam[sat] = team;
+  }
+
+  // Fix-up pass: any member in needsWeekendSet who still has 0 weekends gets swapped in,
+  // displacing a same-role member who already has ≥2 weekends on a weekend where both
+  // are available. If no such swap exists the member remains unassigned (e.g., all leave).
+  {
+    const wkndCountMap = {};
+    for (let d = 1; d <= days; d++) {
+      if (getDow(year, month, d) !== 6) continue;
+      if (lockedDays && lockedDays.has(d)) continue;
+      (weekendNonDocTeam[d] || []).forEach(id => { wkndCountMap[id] = (wkndCountMap[id] || 0) + 1; });
+    }
+    for (const memberId of needsWeekendSet) {
+      if (assignedToWeekend.has(memberId)) continue;
+      const member = getMember(memberId);
+      if (!member) continue;
+      for (let d = 1; d <= days; d++) {
+        if (getDow(year, month, d) !== 6) continue;
+        if (lockedDays && lockedDays.has(d)) continue;
+        const satLv = leave[d] || [];
+        const sun = d + 1;
+        const sunLv = sun <= days ? (leave[sun] || []) : [];
+        if (satLv.includes(memberId) || (sun <= days && sunLv.includes(memberId))) continue;
+        const team = weekendNonDocTeam[d] || [];
+        const toReplace = team
+          .filter(id => getMember(id)?.role === member.role)
+          .find(id => (wkndCountMap[id] || 0) >= 2);
+        if (toReplace) {
+          weekendNonDocTeam[d] = team.filter(id => id !== toReplace).concat([memberId]);
+          wkndCountMap[memberId] = (wkndCountMap[memberId] || 0) + 1;
+          wkndCountMap[toReplace] = Math.max(0, (wkndCountMap[toReplace] || 0) - 1);
+          assignedToWeekend.add(memberId);
+          break;
+        }
+      }
+    }
   }
 
   // Pre-seed cnt with weekend shifts so weekday selection deprioritises
