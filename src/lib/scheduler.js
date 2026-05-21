@@ -152,9 +152,9 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
     }
   }
 
-  // Compute per-person shift targets: total shifts / staff count.
-  // e.g. 20 weekdays×3 + 9 weekends×2 = 78 / 9 staff = 8.67 → 6 people get 9, 3 get 8.
-  // Randomly decide who gets the extra day so the gap is always ≤ 1.
+  // Compute per-person shift caps weighted by availability (leave-aware).
+  // Members with more leave days get proportionally lower caps, preventing
+  // always-available members from absorbing all overflow shifts.
   let totalNonDoctorShifts = 0;
   for (let d = 1; d <= days; d++) {
     const dow = getDow(year, month, d);
@@ -170,16 +170,20 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   const nonDoctors = members.filter(m => m.role !== "doctor");
   let personalCap = null;
   if (nonDoctors.length > 0) {
-    const base = Math.floor(totalNonDoctorShifts / nonDoctors.length);
-    const extra = totalNonDoctorShifts - base * nonDoctors.length;
-    const shuffled = [...nonDoctors];
-    if (useRandom) {
-      for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-      }
+    // Count leave days per non-doctor member
+    const leaveCount = {};
+    nonDoctors.forEach(m => { leaveCount[m.id] = 0; });
+    for (let d = 1; d <= days; d++) {
+      (leave[d] || []).forEach(id => { if (leaveCount[id] !== undefined) leaveCount[id]++; });
     }
-    personalCap = new Map(shuffled.map((m, i) => [m.id, i < extra ? base + 1 : base]));
+    // Available days per member (at least 1 to avoid division by zero)
+    const availDays = new Map(nonDoctors.map(m => [m.id, Math.max(1, days - leaveCount[m.id])]));
+    const totalAvailDays = nonDoctors.reduce((s, m) => s + availDays.get(m.id), 0);
+    // Each member's cap is proportional to their available days
+    personalCap = new Map(nonDoctors.map(m => [
+      m.id,
+      Math.ceil(totalNonDoctorShifts * availDays.get(m.id) / totalAvailDays)
+    ]));
   }
 
   for (let d = 1; d <= days; d++) {
