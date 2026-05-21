@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import html2canvas from "html2canvas";
 import { supabase, dbFetchMembers, dbFetchSchedule, dbFetchLeave, dbFetchHolidays, dbFetchRules, dbFetchPairs } from "./lib/db.js";
 import { autoGenerate, getDaysInMonth, getDow, isWeekend, isFriday } from "./lib/scheduler.js";
@@ -68,6 +68,7 @@ export default function CathScheduler() {
   const calendarRef = useRef(null);
   const [conflictWarnings, setConflictWarnings] = useState([]);
   const [showConflictModal, setShowConflictModal] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
 
   const isAdmin = !!session && (currentUser?.is_admin ?? false);
 
@@ -111,17 +112,24 @@ export default function CathScheduler() {
     } catch (e) { notify("❌ 還原失敗：" + e.message, "err"); }
     setSaving(false);
   }
-  async function exportToJpg() {
-    if (!calendarRef.current) return;
-    try {
-      const canvas = await html2canvas(calendarRef.current,
-        { scale: 2, backgroundColor: "#f1f5f9", useCORS: true });
-      const link = document.createElement("a");
-      link.download = `班表_${year}年${month + 1}月.jpg`;
-      link.href = canvas.toDataURL("image/jpeg", 0.95);
-      link.click();
-    } catch (e) { notify("❌ 匯出失敗：" + e.message, "err"); }
-  }
+  // Step 1: hide decorations by triggering re-render
+  function exportToJpg() { setIsExporting(true); }
+  // Step 2: after DOM re-render with decorations hidden, run html2canvas
+  useEffect(() => {
+    if (!isExporting || !calendarRef.current) return;
+    const run = async () => {
+      try {
+        const canvas = await html2canvas(calendarRef.current,
+          { scale: 2, backgroundColor: "#f1f5f9", useCORS: true });
+        const link = document.createElement("a");
+        link.download = `班表_${year}年${month + 1}月.jpg`;
+        link.href = canvas.toDataURL("image/jpeg", 0.95);
+        link.click();
+      } catch (e) { notify("❌ 匯出失敗：" + e.message, "err"); }
+      setIsExporting(false);
+    };
+    run();
+  }, [isExporting]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auth ────────────────────────────────────────────────────
   useEffect(() => {
@@ -282,6 +290,17 @@ export default function CathScheduler() {
     }
     return violations;
   }
+
+  // Derive conflict set: "day-memberId" keys where consecutive shifts exceed max_consecutive.
+  // Recalculated whenever schedule, rules, year, or month changes.
+  const conflictSet = useMemo(() => {
+    const violations = detectConsecutiveConflicts(schedule);
+    const s = new Set();
+    violations.forEach(v => {
+      for (let d = v.startDay; d <= v.endDay; d++) s.add(`${d}-${v.mbr.id}`);
+    });
+    return s;
+  }, [schedule, rules, year, month]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleAutoGenerate(useRandom = false) {
     const holidayDays = new Set(
@@ -686,31 +705,36 @@ export default function CathScheduler() {
               const isSelected = selectedDay === d;
               const isLocked = lockedDays.has(d);
               const holName = holidayMap[d];
+              const hasCellConflict = !isExporting && assigned.some(id => conflictSet.has(`${d}-${id}`));
               return (
                 <div key={d}
-                  style={{ ...S.cell, ...(wg ? S.cellWG : {}), ...(fri ? S.cellFri : {}), ...(holName ? S.cellHoliday : {}), ...(isToday(d) ? S.cellToday : {}), ...(isSelected && !editMode ? S.cellSelected : {}), ...(editMode ? S.cellEditMode : {}), ...(isMobile ? { minHeight: 58, padding: "4px 3px" } : {}) }}
+                  style={{ ...S.cell, ...(wg ? S.cellWG : {}), ...(!wg && !holName ? S.cellWeekday : {}), ...(holName ? S.cellHoliday : {}), ...(isToday(d) ? S.cellToday : {}), ...(isSelected && !editMode ? S.cellSelected : {}), ...(editMode ? S.cellEditMode : {}), ...(isMobile ? { minHeight: 58, padding: "4px 3px" } : {}) }}
                   onClick={() => { if (!editMode) setSelectedDay(isSelected ? null : d); }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
                     <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#0f172a" }}>{d}</div>
                     <span style={{ fontSize: isMobile ? 9 : 11, fontWeight: 600, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#94a3b8" }}>{DOW_LABELS[dow]}</span>
-                    {isLocked && <span title="手動排定" style={S.lockIcon}>🔒</span>}
+                    {isLocked && !isExporting && <span title="手動排定" style={S.lockIcon}>🔒</span>}
                   </div>
+                  {hasCellConflict && (
+                    <div title="連續值班超標" style={{ position: "absolute", top: 3, right: 6, width: 8, height: 8, borderRadius: "50%", background: "#ef4444", zIndex: 1 }} />
+                  )}
                   {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
                   <div style={S.cellMembers}>
                     {[...assigned].sort((a, b) => (ROLE_ORDER[getMember(a)?.role] ?? 9) - (ROLE_ORDER[getMember(b)?.role] ?? 9)).map(id => {
                       const mbr = getMember(id);
                       if (!mbr) return null;
+                      const hasConflict = conflictSet.has(`${d}-${id}`) && !isExporting;
                       return (
                         <span key={id}
-                          style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}) }}
+                          style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}), ...(hasConflict ? { outline: "1.5px solid #ef4444", outlineOffset: "-1px" } : {}) }}
                           onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
                           title={editMode && isAdmin ? "點擊移除" : mbr.name}>
-                          {editMode && isAdmin && <span style={S.chipRemove}>✕ </span>}
+                          {editMode && isAdmin && !isExporting && <span style={S.chipRemove}>✕ </span>}
                           {isMobile ? mbr.name.slice(-2) : mbr.name}
                         </span>
                       );
                     })}
-                    {editMode && isAdmin && (
+                    {editMode && isAdmin && !isExporting && (
                       <span style={S.chipAdd} onClick={(e) => { e.stopPropagation(); setSelectedDay(d === selectedDay ? null : d); }}>+ 加入</span>
                     )}
                   </div>
