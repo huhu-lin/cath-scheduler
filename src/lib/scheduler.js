@@ -75,13 +75,15 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   const wkndRadCapVal = allRads.length > 0 ? Math.ceil(numSats / allRads.length) : 1;
   const wkndRadCap = new Map(allRads.map(m => [m.id, wkndRadCapVal]));
 
-  // When the month has exactly 4 Saturdays, one nurse is exempt from all weekends.
-  // The exempt slot rotates by month index (month % numNurses) so each nurse gets a
-  // rest in turn across months.
+  // When the month has exactly 4 Saturdays AND there are more nurses than total weekend
+  // nurse slots, exempt one nurse from all weekends (rotates monthly by sort_order index).
+  // Only exempt when numNurses > numSats × weekend_nurse, so the remaining active nurses
+  // each cover exactly one weekend without anyone being forced to double up.
   const allNursesSorted = members.filter(m => m.role === "nurse")
     .sort((a, b) => (a.sort_order ?? 9999) - (b.sort_order ?? 9999));
+  const totalNurseWeekendSlots = numSats * r.weekend_nurse;
   let exemptNurseId = null;
-  if (numSats === 4 && allNursesSorted.length > 0) {
+  if (numSats === 4 && allNursesSorted.length > totalNurseWeekendSlots) {
     exemptNurseId = allNursesSorted[month % allNursesSorted.length].id;
   }
 
