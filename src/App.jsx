@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import html2canvas from "html2canvas";
 import { supabase, dbFetchMembers, dbFetchSchedule, dbFetchLeave, dbFetchHolidays, dbFetchRules, dbFetchPairs } from "./lib/db.js";
 import { autoGenerate, getDaysInMonth, getDow, isWeekend, isFriday } from "./lib/scheduler.js";
 import { ROLES, ROLE_LABELS, ROLE_COLORS, DEFAULT_COLORS, ROLE_ORDER, DEFAULT_RULES, DOW_LABELS, DOW_LABELS_MON, MONTH_NAMES } from "./lib/constants.js";
@@ -63,6 +64,10 @@ export default function CathScheduler() {
   const [newPair, setNewPair]         = useState({ a: "", b: "" });
   const [newAvoidPair, setNewAvoidPair] = useState({ a: "", b: "" });
   const [pairSaving, setPairSaving]   = useState(false);
+  const [undoStack, setUndoStack] = useState([]);
+  const calendarRef = useRef(null);
+  const [conflictWarnings, setConflictWarnings] = useState([]);
+  const [showConflictModal, setShowConflictModal] = useState(false);
 
   const isAdmin = !!session && (currentUser?.is_admin ?? false);
 
@@ -70,6 +75,53 @@ export default function CathScheduler() {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 3000);
   };
+
+  function snapshotNow() {
+    return {
+      schedule: Object.fromEntries(Object.entries(schedule).map(([k, v]) => [k, [...v]])),
+      lockedDays: new Set(lockedDays),
+      manualSchedule: Object.fromEntries(Object.entries(manualSchedule).map(([k, v]) => [k, [...v]])),
+    };
+  }
+  function pushUndo() {
+    setUndoStack(prev => [...prev.slice(-9), snapshotNow()]);
+  }
+  async function handleUndo() {
+    if (undoStack.length === 0) return;
+    const snap = undoStack[undoStack.length - 1];
+    setUndoStack(prev => prev.slice(0, -1));
+    setSaving(true);
+    try {
+      await supabase.from("schedules").delete().eq("year", year).eq("month", month);
+      const rows = [];
+      for (const [day, ids] of Object.entries(snap.schedule)) {
+        const d = parseInt(day);
+        const manSet = new Set(snap.manualSchedule[d] || []);
+        for (const member_id of ids)
+          rows.push({ year, month, day: d, member_id, manually_set: manSet.has(member_id) });
+      }
+      if (rows.length > 0) {
+        const { error } = await supabase.from("schedules").insert(rows);
+        if (error) throw error;
+      }
+      setSchedule(snap.schedule);
+      setLockedDays(snap.lockedDays);
+      setManualSchedule(snap.manualSchedule);
+      notify("↩ 已還原上一步");
+    } catch (e) { notify("❌ 還原失敗：" + e.message, "err"); }
+    setSaving(false);
+  }
+  async function exportToJpg() {
+    if (!calendarRef.current) return;
+    try {
+      const canvas = await html2canvas(calendarRef.current,
+        { scale: 2, backgroundColor: "#f1f5f9", useCORS: true });
+      const link = document.createElement("a");
+      link.download = `班表_${year}年${month + 1}月.jpg`;
+      link.href = canvas.toDataURL("image/jpeg", 0.95);
+      link.click();
+    } catch (e) { notify("❌ 匯出失敗：" + e.message, "err"); }
+  }
 
   // ── Auth ────────────────────────────────────────────────────
   useEffect(() => {
@@ -134,6 +186,7 @@ export default function CathScheduler() {
 
   // ── Schedule ops ────────────────────────────────────────────
   async function saveFullSchedule(newSched) {
+    pushUndo();
     setSaving(true);
     try {
       await supabase.from("schedules").delete()
@@ -159,6 +212,7 @@ export default function CathScheduler() {
 
   async function toggleAssign(day, memberId) {
     if (saving || !isAdmin) return;
+    pushUndo();
     const arr = schedule[day] ? [...schedule[day]] : [];
     const isOn = arr.includes(memberId);
     setSaving(true);
@@ -209,11 +263,36 @@ export default function CathScheduler() {
     setSaving(false);
   }
 
+  function detectConsecutiveConflicts(sched) {
+    const days = getDaysInMonth(year, month);
+    const maxC = rules.max_consecutive;
+    const violations = [];
+    for (const mbr of members) {
+      let streak = 0, streakStart = 1;
+      for (let d = 1; d <= days; d++) {
+        if ((sched[d] || []).includes(mbr.id)) {
+          if (streak === 0) streakStart = d;
+          streak++;
+        } else {
+          if (streak > maxC) violations.push({ mbr, startDay: streakStart, endDay: d - 1, streak });
+          streak = 0;
+        }
+      }
+      if (streak > maxC) violations.push({ mbr, startDay: streakStart, endDay: days, streak });
+    }
+    return violations;
+  }
+
   function handleAutoGenerate(useRandom = false) {
     const holidayDays = new Set(
       holidays.filter(h => h.year === year && h.month === month + 1).map(h => h.day)
     );
     const gen = autoGenerate(year, month, members, leaveMap, schedule, lockedDays, holidayDays, rules, pairs, manualSchedule, useRandom);
+    const violations = detectConsecutiveConflicts(gen);
+    if (violations.length > 0) {
+      setConflictWarnings(violations);
+      setShowConflictModal(true);
+    }
     saveFullSchedule(gen);
   }
 
@@ -234,6 +313,7 @@ export default function CathScheduler() {
   }
 
   async function saveDoctorFill() {
+    pushUndo();
     setSaving(true);
     try {
       const doctorIds = [...members.filter(m => m.role === "doctor").map(m => m.id)];
@@ -283,6 +363,7 @@ export default function CathScheduler() {
 
   async function handleClearSchedule() {
     if (!window.confirm(`確定要清除 ${year}年${month + 1}月 所有排班（包含手動鎖定）？`)) return;
+    pushUndo();
     setSaving(true);
     try {
       const { error } = await supabase.from("schedules").delete().eq("year", year).eq("month", month);
@@ -446,6 +527,9 @@ export default function CathScheduler() {
           </div>
         </div>
         <div style={S.headerRight}>
+          <span style={{ fontSize: 12, color: "#94a3b8", fontWeight: 500, whiteSpace: "nowrap" }}>
+            今日 {today.getMonth() + 1}/{today.getDate()}
+          </span>
           {saving && <span style={S.savingTxt}>⟳ 儲存中...</span>}
           {session ? (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -537,6 +621,9 @@ export default function CathScheduler() {
           setSelectedDay(null); setEditMode(false);
           if (month === 11) { setYear(y => y + 1); setMonth(0); } else setMonth(m => m + 1);
         }}>›</button>
+        <button style={{ ...S.btnSmall, fontSize: 11 }}
+          onClick={() => { setYear(today.getFullYear()); setMonth(today.getMonth()); setSelectedDay(null); }}
+          title="回到本月">今月</button>
         {view === "calendar" && isAdmin && (
           <>
             <button style={S.genBtn} onClick={() => { setGenConfirmUseRandom(false); setShowGenConfirm(true); }} disabled={saving || loading} title="自動排班">
@@ -556,8 +643,17 @@ export default function CathScheduler() {
             <button style={S.clearBtn} onClick={handleClearSchedule} disabled={saving || loading} title="清除">
               {isMobile ? "🗑️" : "🗑️ 清除"}
             </button>
+            <button style={{ ...S.docFillBtn, color: "#0891b2", borderColor: "#7dd3fc" }}
+              onClick={() => saveFullSchedule(schedule)} disabled={saving || loading} title="儲存班表">
+              {isMobile ? "💾" : "💾 儲存"}
+            </button>
+            <button style={{ ...S.btnSmall }}
+              onClick={handleUndo} disabled={undoStack.length === 0 || saving || loading} title="上一步">
+              {isMobile ? "↩" : "↩ 上一步"}
+            </button>
           </>
         )}
+        <button style={S.reloadBtn} onClick={exportToJpg} title="匯出 JPG">📷</button>
         <button style={S.reloadBtn} onClick={loadAll} disabled={loading}>↺</button>
       </div>
 
@@ -569,14 +665,19 @@ export default function CathScheduler() {
       {/* ── Calendar ── */}
       {view === "calendar" && (
         <div style={{ ...S.content, padding: isMobile ? "6px 4px 60px" : "8px 10px 48px" }}>
+          <div ref={calendarRef} style={{ background: "#f1f5f9", padding: 4, borderRadius: 8 }}>
+          <div style={{ textAlign: "center", fontWeight: 800, fontSize: isMobile ? 14 : 16,
+            color: "#1e293b", padding: "6px 0 8px" }}>
+            {year}年{MONTH_NAMES[month]}份班表
+          </div>
           <div style={S.calGrid}>
             {DOW_LABELS_MON.map((d, i) => (
-              <div key={d} style={{ ...S.dowHeader, color: i === 6 ? "#dc2626" : i === 5 ? "#2563eb" : "#64748b" }}>{d}</div>
+              <div key={d} style={{ ...S.dowHeader, color: (i === 5 || i === 6) ? "#dc2626" : "#64748b" }}>{d}</div>
             ))}
           </div>
           <div style={S.calGrid}>
             {cells.map((d, i) => {
-              if (!d) return <div key={i} style={S.emptyCell} />;
+              if (!d) return <div key={`e${i}`} style={S.emptyCell} />;
               const dow = getDow(year, month, d);
               const assigned = schedule[d] || [];
               const leaves = leaveMap[d] || [];
@@ -590,10 +691,10 @@ export default function CathScheduler() {
                   style={{ ...S.cell, ...(wg ? S.cellWG : {}), ...(fri ? S.cellFri : {}), ...(holName ? S.cellHoliday : {}), ...(isToday(d) ? S.cellToday : {}), ...(isSelected && !editMode ? S.cellSelected : {}), ...(editMode ? S.cellEditMode : {}), ...(isMobile ? { minHeight: 58, padding: "4px 3px" } : {}) }}
                   onClick={() => { if (!editMode) setSelectedDay(isSelected ? null : d); }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                    <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
+                    <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#0f172a" }}>{d}</div>
+                    <span style={{ fontSize: isMobile ? 9 : 11, fontWeight: 600, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#94a3b8" }}>{DOW_LABELS[dow]}</span>
                     {isLocked && <span title="手動排定" style={S.lockIcon}>🔒</span>}
                   </div>
-                  {!isMobile && <div style={S.cellDow}>{DOW_LABELS[dow]}{wg ? " 🌙" : fri ? " ★" : ""}</div>}
                   {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
                   <div style={S.cellMembers}>
                     {[...assigned].sort((a, b) => (ROLE_ORDER[getMember(a)?.role] ?? 9) - (ROLE_ORDER[getMember(b)?.role] ?? 9)).map(id => {
@@ -613,11 +714,29 @@ export default function CathScheduler() {
                       <span style={S.chipAdd} onClick={(e) => { e.stopPropagation(); setSelectedDay(d === selectedDay ? null : d); }}>+ 加入</span>
                     )}
                   </div>
-                  {leaves.length > 0 && <div style={S.leaveHint}>休 {leaves.length}</div>}
                 </div>
               );
             })}
           </div>
+
+          {/* ── 人員電話表格 ── */}
+          <div style={{ marginTop: 10, background: "#fff", borderRadius: 8, border: "1px solid #e2e8f0", overflow: "hidden" }}>
+            <div style={{ background: "#f1f5f9", padding: "6px 12px", fontWeight: 700, fontSize: 13, color: "#475569", borderBottom: "1px solid #e2e8f0" }}>
+              📞 人員電話
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: isMobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)" }}>
+              {members.map((mbr, i) => (
+                <div key={mbr.id} style={{ padding: "5px 10px", fontSize: isMobile ? 11 : 12,
+                  borderRight: (isMobile ? i % 2 !== 1 : i % 4 !== 3) ? "1px solid #f1f5f9" : "none",
+                  borderBottom: "1px solid #f1f5f9", display: "flex", gap: 6, alignItems: "center" }}>
+                  <span style={{ ...S.dot, background: ROLE_COLORS[mbr.role], width: 8, height: 8, flexShrink: 0 }} />
+                  <span style={{ fontWeight: 700, color: "#1e293b", whiteSpace: "nowrap" }}>{mbr.name}</span>
+                  <span style={{ color: "#64748b", fontSize: isMobile ? 10 : 11 }}>{mbr.phone || "—"}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          </div>{/* end calendarRef */}
 
         </div>
       )}
@@ -746,6 +865,35 @@ export default function CathScheduler() {
         </div>
       )}
 
+      {/* ── Consecutive conflict warning modal ── */}
+      {showConflictModal && (
+        <div style={S.modalOverlay} onClick={() => setShowConflictModal(false)}>
+          <div style={{ ...S.modalBox, maxWidth: 480, width: "94vw" }} onClick={e => e.stopPropagation()}>
+            <div style={{ ...S.modalTitle, color: "#dc2626" }}>⚠️ 連續值班衝突</div>
+            <div style={{ fontSize: 13, color: "#64748b", marginBottom: 12 }}>
+              以下人員超過最大連續天數上限（{rules.max_consecutive} 天），已包含週末與假日：
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+              {conflictWarnings.map((v, i) => (
+                <div key={i} style={{ background: "#fee2e2", borderRadius: 8, padding: "8px 12px", fontSize: 13 }}>
+                  <span style={{ fontWeight: 700, color: "#dc2626" }}>{v.mbr.name}</span>
+                  　{month + 1}/{v.startDay}（{DOW_LABELS[getDow(year, month, v.startDay)]}）
+                  ～ {month + 1}/{v.endDay}（{DOW_LABELS[getDow(year, month, v.endDay)]}）
+                  ，連續 <strong>{v.streak}</strong> 天
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button style={S.btnSecondary} onClick={() => setShowConflictModal(false)}>保持現狀</button>
+              <button style={S.btnPrimary}
+                onClick={() => { setShowConflictModal(false); handleAutoGenerate(true); }}>
+                🔀 重新排班
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Doctor quick-fill modal ── */}
       {doctorFillOpen && isAdmin && (
         <div style={S.modalOverlay} onClick={() => setDoctorFillOpen(false)}>
@@ -791,34 +939,37 @@ export default function CathScheduler() {
           </div>
           <div style={S.calGrid}>
             {DOW_LABELS_MON.map((d, i) => (
-              <div key={d} style={{ ...S.dowHeader, color: i === 6 ? "#dc2626" : i === 5 ? "#2563eb" : "#64748b" }}>{d}</div>
+              <div key={d} style={{ ...S.dowHeader, color: (i === 5 || i === 6) ? "#dc2626" : "#64748b" }}>{d}</div>
             ))}
           </div>
           <div style={S.calGrid}>
             {cells.map((d, i) => {
-              if (!d) return <div key={i} style={S.emptyCell} />;
+              if (!d) return <div key={`e${i}`} style={S.emptyCell} />;
               const dow = getDow(year, month, d);
               const leaves = leaveMap[d] || [];
               const holName = holidayMap[d];
               const isSelDay = leaveSelectedDay === d;
+              const wgLeave = isWeekend(dow);
               return (
                 <div key={d}
-                  style={{ ...S.cell, ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), ...(isSelDay ? S.cellSelected : {}), minHeight: isMobile ? 60 : 88, ...(isMobile ? { padding: "4px 3px", cursor: "pointer" } : {}) }}
+                  style={{ ...S.cell, ...(wgLeave ? S.cellWG : {}), ...(isToday(d) ? S.cellToday : {}), ...(holName ? S.cellHoliday : {}), ...(isSelDay ? S.cellSelected : {}), minHeight: isMobile ? 60 : 88, ...(isMobile ? { padding: "4px 3px", cursor: "pointer" } : {}) }}
                   onClick={() => isMobile && setLeaveSelectedDay(isSelDay ? null : d)}>
-                  <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: dow === 0 ? "#dc2626" : dow === 6 ? "#2563eb" : "#0f172a" }}>{d}</div>
-                  {!isMobile && <div style={S.cellDow}>{DOW_LABELS[dow]}</div>}
+                  <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                    <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#0f172a" }}>{d}</div>
+                    <span style={{ fontSize: isMobile ? 9 : 11, fontWeight: 600, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#94a3b8" }}>{DOW_LABELS[dow]}</span>
+                  </div>
                   {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
                   {isMobile ? (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 2, marginTop: 2 }}>
                       {leaves.map(id => {
                         const mbr = getMember(id);
-                        if (!mbr) return null;
+                        if (!mbr || mbr.role === "doctor") return null;
                         return <span key={id} style={{ ...S.dot, width: 7, height: 7, background: ROLE_COLORS[mbr.role] }} title={mbr.name} />;
                       })}
                     </div>
                   ) : (
                     <div style={S.cellMembers}>
-                      {members.map(mbr => {
+                      {members.filter(m => m.role !== "doctor").map(mbr => {
                         const onLeave = leaves.includes(mbr.id);
                         const canEdit = isAdmin || currentUser?.id === mbr.id;
                         return (
@@ -843,7 +994,7 @@ export default function CathScheduler() {
                 <button style={S.panelClose} onClick={() => setLeaveSelectedDay(null)}>✕</button>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {members.map(mbr => {
+                {members.filter(m => m.role !== "doctor").map(mbr => {
                   const onLeave = (leaveMap[leaveSelectedDay] || []).includes(mbr.id);
                   const canEdit = isAdmin || currentUser?.id === mbr.id;
                   return (

@@ -13,12 +13,10 @@ function getWeekKey(y, m, d) {
   return d - daysSinceMon;
 }
 
-// Consecutive weekday streak — weekends and national holidays break/reset the streak
-function getStreak(sched, day, memberId, year, month, holidayDays) {
+// Consecutive streak — all days (including weekends and holidays) count
+function getStreak(sched, day, memberId) {
   let s = 0;
   for (let d = day - 1; d >= 1; d--) {
-    const dow = getDow(year, month, d);
-    if (isWeekend(dow) || (holidayDays && holidayDays.has(d))) break;
     if ((sched[d] || []).includes(memberId)) s++;
     else break;
   }
@@ -72,6 +70,15 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   // Use a dedicated counter so successive weekends rotate to different staff.
   const weekendNonDocTeam = {}; // satDay → [memberId, ...]
   const wkndCnt = Object.fromEntries(members.map(m => [m.id, 0]));
+
+  // Strict radiologist cap: each rad gets at most ceil(numSaturdays / numRads) weekends.
+  // With 4 rads & 4 weekends → cap=1 (no rad doubles); with 4 rads & 5 weekends → cap=2.
+  const allRads = members.filter(m => m.role === "radiologist");
+  let numSats = 0;
+  for (let d = 1; d <= days; d++) if (getDow(year, month, d) === 6) numSats++;
+  const wkndRadCapVal = allRads.length > 0 ? Math.ceil(numSats / allRads.length) : 1;
+  const wkndRadCap = new Map(allRads.map(m => [m.id, wkndRadCapVal]));
+
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue; // only Saturdays
     const sat = d, sun = d + 1;
@@ -85,7 +92,7 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
     );
     const sel = new Set(), used = new Set(), team = [];
     const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
-      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom);
+      availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, wkndRadCap);
     rads.forEach(m => { team.push(m.id); used.add(m.id); sel.add(m.id); });
     const nurses = pick(availBoth.filter(m => m.role === "nurse" && !used.has(m.id)), wkndCnt, r.weekend_nurse,
       availBoth.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom);
@@ -191,7 +198,7 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       const lv = leave[d] || [];
       const avail = members.filter(m => !lv.includes(m.id) && !usedIds.has(m.id));
       const maxC = r.max_consecutive;
-      const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
+      const eligible = m => getStreak(sched, d, m.id) < maxC;
       const numRad   = manualIds.filter(id => getMember(id)?.role === "radiologist").length;
       const numNurse = manualIds.filter(id => getMember(id)?.role === "nurse").length;
 
@@ -238,7 +245,7 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
 
     const lv = leave[d] || [];
     const maxC = r.max_consecutive;
-    const eligible = m => getStreak(sched, d, m.id, year, month, holidayDays) < maxC;
+    const eligible = m => getStreak(sched, d, m.id) < maxC;
 
     if (isWeekend(dow)) {
       // Weekend: use pre-computed team (same Sat+Sun)
@@ -283,27 +290,18 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       const used = new Set();
       const currentWeekCnt = weekCnt[getWeekKey(year, month, d)] || {};
 
-      // For Monday: exclude members who worked the preceding weekend (Sat/Sun)
-      // to prevent cross-week consecutive shifts.
-      const prevWknd = new Set();
-      if (dow === 1) {
-        if (d - 1 >= 1) (sched[d-1] || []).forEach(id => prevWknd.add(id));
-        if (d - 2 >= 1) (sched[d-2] || []).forEach(id => prevWknd.add(id));
-      }
-      const eligMon = m => eligible(m) && !prevWknd.has(m.id);
-
       // Ensure at least 1 rad and 1 nurse before filling to quota
-      pick(avail.filter(m => m.role === "radiologist").filter(eligMon), cnt, 1,
+      pick(avail.filter(m => m.role === "radiologist").filter(eligible), cnt, 1,
         avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-      pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)).filter(eligMon), cnt, 1,
+      pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)).filter(eligible), cnt, 1,
         avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       const filled = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligMon), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
+        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
       sched[d] = result;
