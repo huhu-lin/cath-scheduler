@@ -38,7 +38,7 @@ export const S = {
   cell: { background: "#fff", borderRadius: 8, padding: "7px 6px", minHeight: 80, cursor: "pointer", border: "1.5px solid #e2e8f0", outline: "none", transition: "border-color 0.15s, box-shadow 0.15s", position: "relative", overflow: "hidden", boxShadow: "0 1px 2px #0001" },
   cellWG: { background: "#ffe4ec", borderColor: "#fecdd3" },
   cellFri: { background: "#fffbeb", borderColor: "#fde68a" },
-  cellHoliday: { background: "#fff1f2", borderColor: "#fecdd3" },
+  cellHoliday: { background: "#ffe4ec", borderColor: "#fecdd3" },
   cellToday: { borderColor: "#0891b2", boxShadow: "0 0 0 2px #0891b230" },
   cellSelected: { borderColor: "#0891b2", background: "#e0f2fe" },
   cellWeekday: { border: "1.5px solid #1e293b", background: "#fff" },

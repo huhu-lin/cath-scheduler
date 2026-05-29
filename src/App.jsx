@@ -710,28 +710,36 @@ export default function CathScheduler() {
                 <div key={d}
                   style={{ ...S.cell, ...(wg ? S.cellWG : {}), ...(!wg && !holName ? S.cellWeekday : {}), ...(holName ? S.cellHoliday : {}), ...(isToday(d) ? S.cellToday : {}), ...(isSelected && !editMode ? S.cellSelected : {}), ...(editMode ? S.cellEditMode : {}), ...(isMobile ? { minHeight: 58, padding: "4px 3px" } : {}) }}
                   onClick={() => { if (!editMode) setSelectedDay(isSelected ? null : d); }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 3, flexWrap: "wrap" }}>
                     <div style={{ ...S.cellDay, fontSize: isMobile ? 12 : 15, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#0f172a" }}>{d}</div>
                     <span style={{ fontSize: isMobile ? 9 : 11, fontWeight: 600, color: (dow === 0 || dow === 6 || !!holName) ? "#dc2626" : "#94a3b8" }}>{DOW_LABELS[dow]}</span>
+                    {holName && <span style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10, marginBottom: 0 }}>{isMobile ? holName.slice(0, 2) : holName}</span>}
                     {isLocked && !isExporting && <span title="手動排定" style={S.lockIcon}>🔒</span>}
                   </div>
                   {hasCellConflict && (
                     <div title="連續值班超標" style={{ position: "absolute", top: 3, right: 6, width: 8, height: 8, borderRadius: "50%", background: "#ef4444", zIndex: 1 }} />
                   )}
-                  {holName && <div style={{ ...S.holidayLabel, fontSize: isMobile ? 9 : 10 }}>{isMobile ? holName.slice(0, 2) : holName}</div>}
-                  <div style={S.cellMembers}>
-                    {[...assigned].sort((a, b) => (ROLE_ORDER[getMember(a)?.role] ?? 9) - (ROLE_ORDER[getMember(b)?.role] ?? 9)).map(id => {
-                      const mbr = getMember(id);
-                      if (!mbr) return null;
-                      const hasConflict = conflictSet.has(`${d}-${id}`) && !isExporting;
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 2 }}>
+                    {["doctor", "radiologist", "nurse", "other"].map(role => {
+                      const roleIds = assigned.filter(id => getMember(id)?.role === role);
+                      if (roleIds.length === 0) return null;
                       return (
-                        <span key={id}
-                          style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}), ...(hasConflict ? { outline: "1.5px solid #ef4444", outlineOffset: "-1px" } : {}) }}
-                          onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
-                          title={editMode && isAdmin ? "點擊移除" : mbr.name}>
-                          {editMode && isAdmin && !isExporting && <span style={S.chipRemove}>✕ </span>}
-                          {isMobile ? mbr.name.slice(-2) : mbr.name}
-                        </span>
+                        <div key={role} style={{ display: "flex", flexWrap: "wrap", gap: 2 }}>
+                          {roleIds.map(id => {
+                            const mbr = getMember(id);
+                            if (!mbr) return null;
+                            const hasConflict = conflictSet.has(`${d}-${id}`) && !isExporting;
+                            return (
+                              <span key={id}
+                                style={{ ...S.chip, ...(isMobile ? { fontSize: 9, padding: "1px 3px", borderRadius: 5 } : {}), background: ROLE_COLORS[mbr.role] + "22", color: ROLE_COLORS[mbr.role], border: `1.5px solid ${ROLE_COLORS[mbr.role]}55`, ...(editMode && isAdmin ? S.chipEditable : {}), ...(hasConflict ? { outline: "1.5px solid #ef4444", outlineOffset: "-1px" } : {}) }}
+                                onClick={editMode && isAdmin ? (e) => { e.stopPropagation(); toggleAssign(d, id); } : undefined}
+                                title={editMode && isAdmin ? "點擊移除" : mbr.name}>
+                                {editMode && isAdmin && !isExporting && <span style={S.chipRemove}>✕ </span>}
+                                {isMobile ? mbr.name.slice(-2) : mbr.name}
+                              </span>
+                            );
+                          })}
+                        </div>
                       );
                     })}
                     {editMode && isAdmin && !isExporting && (

@@ -216,9 +216,9 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
     }
   }
 
-  // Compute per-person shift caps weighted by availability (leave-aware).
-  // Members with more leave days get proportionally lower caps, preventing
-  // always-available members from absorbing all overflow shifts.
+  // Compute equal shift caps so every non-doctor gets the same base count (± 1 for remainders).
+  // A separate hard belowCap filter on the primary pick pool enforces these caps strictly,
+  // preventing any single member from absorbing overflow shifts when others are on leave.
   let totalNonDoctorShifts = 0;
   for (let d = 1; d <= days; d++) {
     const dow = getDow(year, month, d);
@@ -234,21 +234,20 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   const nonDoctors = members.filter(m => m.role !== "doctor");
   let personalCap = null;
   if (nonDoctors.length > 0) {
-    // Count leave days per non-doctor member
-    const leaveCount = {};
-    nonDoctors.forEach(m => { leaveCount[m.id] = 0; });
-    for (let d = 1; d <= days; d++) {
-      (leave[d] || []).forEach(id => { if (leaveCount[id] !== undefined) leaveCount[id]++; });
+    const base = Math.floor(totalNonDoctorShifts / nonDoctors.length);
+    const extra = totalNonDoctorShifts - base * nonDoctors.length;
+    const shuffled = [...nonDoctors];
+    if (useRandom) {
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
     }
-    // Available days per member (at least 1 to avoid division by zero)
-    const availDays = new Map(nonDoctors.map(m => [m.id, Math.max(1, days - leaveCount[m.id])]));
-    const totalAvailDays = nonDoctors.reduce((s, m) => s + availDays.get(m.id), 0);
-    // Each member's cap is proportional to their available days
-    personalCap = new Map(nonDoctors.map(m => [
-      m.id,
-      Math.ceil(totalNonDoctorShifts * availDays.get(m.id) / totalAvailDays)
-    ]));
+    personalCap = new Map(shuffled.map((m, i) => [m.id, i < extra ? base + 1 : base]));
   }
+  // Hard cap predicate: exclude members at/over their cap from the PRIMARY pick pool only.
+  // The fallback pool (used when primary is too small) ignores this so required slots always fill.
+  const belowCap = m => !personalCap || (cnt[m.id] || 0) < (personalCap.get(m.id) ?? Infinity);
 
   for (let d = 1; d <= days; d++) {
     if (lockedDays && lockedDays.has(d)) {
@@ -276,27 +275,27 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
         const needNurse = Math.max(0, r.weekend_nurse - numNurse);
         if (needRad > 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool, cnt, needRad, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(belowCap), cnt, needRad, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (needNurse > 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool, cnt, needNurse, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(belowCap), cnt, needNurse, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
       } else {
         // Weekday (Mon–Fri): fill to weekday quotas
         if (numRad === 0) {
           const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible).filter(belowCap), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         if (numNurse === 0) {
           const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible).filter(belowCap), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
         const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
         const needMore = r.weekday_rad_nurse - currentRN;
         if (needMore > 0) {
           const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
-          pick(pool.filter(eligible), cnt, needMore, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+          pick(pool.filter(eligible).filter(belowCap), cnt, needMore, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
         }
       }
       sched[d] = result;
@@ -324,9 +323,9 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
         const avail = members.filter(m => (m.role === "radiologist" || m.role === "nurse") && !lv.includes(m.id));
         const sel = new Set();
         const result = [];
-        pick(avail.filter(m => m.role === "radiologist"), cnt, r.weekend_radiologist, avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap)
+        pick(avail.filter(m => m.role === "radiologist").filter(belowCap), cnt, r.weekend_radiologist, avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); sel.add(m.id); });
-        pick(avail.filter(m => m.role === "nurse" && !sel.has(m.id)), cnt, r.weekend_nurse, avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap)
+        pick(avail.filter(m => m.role === "nurse" && !sel.has(m.id)).filter(belowCap), cnt, r.weekend_nurse, avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap)
           .forEach(m => { result.push(m.id); });
         sched[d] = result;
       } else {
@@ -346,7 +345,7 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       if (remaining > 0) {
         const currentWeekCnt = weekCnt[getWeekKey(year, month, d)] || {};
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
+        pick(rnPool.filter(eligible).filter(belowCap), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
       sched[d] = result;
@@ -359,17 +358,17 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       const currentWeekCnt = weekCnt[getWeekKey(year, month, d)] || {};
 
       // Ensure at least 1 rad and 1 nurse before filling to quota
-      pick(avail.filter(m => m.role === "radiologist").filter(eligible), cnt, 1,
+      pick(avail.filter(m => m.role === "radiologist").filter(eligible).filter(belowCap), cnt, 1,
         avail.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
-      pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)).filter(eligible), cnt, 1,
+      pick(avail.filter(m => m.role === "nurse" && !used.has(m.id)).filter(eligible).filter(belowCap), cnt, 1,
         avail.filter(m => m.role === "nurse"), sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
         .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       const filled = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
       const remaining = r.weekday_rad_nurse - filled;
       if (remaining > 0) {
         const rnPool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !used.has(m.id));
-        pick(rnPool.filter(eligible), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
+        pick(rnPool.filter(eligible).filter(belowCap), cnt, remaining, rnPool, sel, pairsMap, avoidMap, useRandom, personalCap, currentWeekCnt)
           .forEach(m => { result.push(m.id); used.add(m.id); sel.add(m.id); });
       }
       sched[d] = result;
