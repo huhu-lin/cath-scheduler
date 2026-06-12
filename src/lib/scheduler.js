@@ -104,16 +104,55 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
     const sat = d, sun = d + 1;
     const satLv = leave[sat] || [];
     const sunLv = sun <= days ? (leave[sun] || []) : [];
-    // Pick members available on BOTH Sat and Sun (or just Sat if Sun is next month)
+    // Priority set: members who still need their first weekend assignment
+    const firstWkndSet = new Set([...needsWeekendSet].filter(id => !assignedToWeekend.has(id)));
+
+    if (lockedDays && lockedDays.has(sat)) {
+      // Locked Saturday: start from manual assignments, auto-fill any missing roles.
+      // This ensures (a) Friday uses the correct base team and (b) Sat and Sun share the same people.
+      const lockedIds = (manualSchedule && manualSchedule[sat])
+        ? [...manualSchedule[sat]]
+        : (existingSched[sat] || []);
+      const team = lockedIds.filter(id => {
+        const m = getMember(id);
+        return m && (m.role === "radiologist" || m.role === "nurse");
+      });
+      const usedLk = new Set(team);
+      const selLk  = new Set(team);
+      team.forEach(id => { if (needsWeekendSet.has(id)) assignedToWeekend.add(id); });
+      const numRadLk   = team.filter(id => getMember(id)?.role === "radiologist").length;
+      const numNurseLk = team.filter(id => getMember(id)?.role === "nurse").length;
+      if (numRadLk < r.weekend_radiologist) {
+        const availRad = members.filter(m =>
+          m.role === "radiologist" && !satLv.includes(m.id) && !usedLk.has(m.id) &&
+          (sun > days || !sunLv.includes(m.id))
+        );
+        pick(availRad, wkndCnt, r.weekend_radiologist - numRadLk,
+          availRad, selLk, pairsMap, avoidMap, useRandom, wkndRadCap, null, firstWkndSet)
+          .forEach(m => { team.push(m.id); usedLk.add(m.id); selLk.add(m.id); assignedToWeekend.add(m.id); });
+      }
+      if (numNurseLk < r.weekend_nurse) {
+        const availNurse = members.filter(m =>
+          m.role === "nurse" && m.id !== exemptNurseId &&
+          !satLv.includes(m.id) && !usedLk.has(m.id) &&
+          (sun > days || !sunLv.includes(m.id))
+        );
+        const nurseFb = members.filter(m => m.role === "nurse" && m.id !== exemptNurseId && !usedLk.has(m.id));
+        pick(availNurse, wkndCnt, r.weekend_nurse - numNurseLk,
+          nurseFb, selLk, pairsMap, avoidMap, useRandom, null, null, firstWkndSet)
+          .forEach(m => { team.push(m.id); usedLk.add(m.id); selLk.add(m.id); assignedToWeekend.add(m.id); });
+      }
+      team.forEach(id => { if (wkndCnt[id] !== undefined) wkndCnt[id]++; });
+      weekendNonDocTeam[sat] = team;
+      continue;
+    }
+
+    // Unlocked Saturday: pick from members available on BOTH Sat and Sun
     const availBoth = members.filter(m =>
       (m.role === "radiologist" || m.role === "nurse") &&
       !satLv.includes(m.id) &&
       (sun > days || !sunLv.includes(m.id))
     );
-
-    // Priority set: members who still need their first weekend assignment
-    const firstWkndSet = new Set([...needsWeekendSet].filter(id => !assignedToWeekend.has(id)));
-
     const sel = new Set(), used = new Set(), team = [];
     const rads = pick(availBoth.filter(m => m.role === "radiologist"), wkndCnt, r.weekend_radiologist,
       availBoth.filter(m => m.role === "radiologist"), sel, pairsMap, avoidMap, useRandom, wkndRadCap, null, firstWkndSet);
@@ -137,7 +176,7 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
     const wkndCountMap = {};
     for (let d = 1; d <= days; d++) {
       if (getDow(year, month, d) !== 6) continue;
-      if (lockedDays && lockedDays.has(d)) continue;
+      // Include all weekends (locked or not) — the pre-pass now covers both.
       (weekendNonDocTeam[d] || []).forEach(id => { wkndCountMap[id] = (wkndCountMap[id] || 0) + 1; });
     }
     for (const memberId of needsWeekendSet) {
@@ -168,12 +207,11 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
 
   // Pre-seed cnt with weekend shifts so weekday selection deprioritises
   // staff who already have weekend duties this month.
-  // Skip locked weekends — those use manualSchedule, not weekendNonDocTeam.
-  // Also include the preceding Friday if it's a normal working day — the Friday
-  // logic uses the same weekend team, so their total "block" is Fri+Sat+Sun.
+  // Both locked and unlocked weekends are included — the pre-pass now builds
+  // weekendNonDocTeam for every Saturday (locked: manual+auto-fill; unlocked: fully auto).
+  // Also include the preceding Friday if it's a normal working day.
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue;
-    if (lockedDays && lockedDays.has(d)) continue;
     const team = weekendNonDocTeam[d] || [];
     const sun = d + 1;
     let daysWorked = sun <= days ? 2 : 1; // Sat + Sun (or just Sat at month-end)
@@ -192,7 +230,6 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   const weekCnt = {};
   for (let d = 1; d <= days; d++) {
     if (getDow(year, month, d) !== 6) continue;
-    if (lockedDays && lockedDays.has(d)) continue;
     const team = weekendNonDocTeam[d] || [];
     const sat = d, sun = d + 1, fri = d - 1;
     const satKey = getWeekKey(year, month, sat); // Fri/Sat/Sun share the same Mon–Sun week key
@@ -211,6 +248,7 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
   if (lockedDays) {
     for (let d = 1; d <= days; d++) {
       if (!lockedDays.has(d)) continue;
+      if (isWeekend(getDow(year, month, d))) continue; // weekends already pre-seeded via weekendNonDocTeam
       const ids = (manualSchedule && manualSchedule[d]) ? manualSchedule[d] : (existingSched[d] || []);
       ids.forEach(id => { if (cnt[id] !== undefined) cnt[id]++; });
     }
@@ -255,10 +293,18 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       // On holidays, keep only the manual assignments — no auto-fill
       if (holidayDays && holidayDays.has(d)) {
         sched[d] = manualIds;
-        // manual members already pre-seeded; no cnt increment needed
         continue;
       }
-      // Keep manually-assigned members; auto-fill the remaining slots
+      // Locked weekends: use the pre-computed team from the pre-pass.
+      // The pre-pass already merged manual assignments with auto-filled roles, so
+      // Sat and Sun get the same people and Friday's base team matches correctly.
+      if (isWeekend(getDow(year, month, d))) {
+        const satDay = getDow(year, month, d) === 6 ? d : d - 1;
+        const lv = leave[d] || [];
+        sched[d] = (weekendNonDocTeam[satDay] || []).filter(id => !lv.includes(id));
+        continue;
+      }
+      // Locked weekday: keep manual assignments, auto-fill remaining slots
       const usedIds = new Set(manualIds);
       const result = [...manualIds];
       const sel = new Set(manualIds);
@@ -268,38 +314,22 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
       const eligible = m => getStreak(sched, d, m.id) < maxC;
       const numRad   = manualIds.filter(id => getMember(id)?.role === "radiologist").length;
       const numNurse = manualIds.filter(id => getMember(id)?.role === "nurse").length;
-
-      if (isWeekend(getDow(year, month, d))) {
-        // Respect manual assignments; only fill up to quota
-        const needRad   = Math.max(0, r.weekend_radiologist - numRad);
-        const needNurse = Math.max(0, r.weekend_nurse - numNurse);
-        if (needRad > 0) {
-          const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(belowCap), cnt, needRad, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-        if (needNurse > 0) {
-          const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(belowCap), cnt, needNurse, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-      } else {
-        // Weekday (Mon–Fri): fill to weekday quotas
-        if (numRad === 0) {
-          const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
-          pick(pool.filter(eligible).filter(belowCap), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-        if (numNurse === 0) {
-          const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
-          pick(pool.filter(eligible).filter(belowCap), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
-        const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
-        const needMore = r.weekday_rad_nurse - currentRN;
-        if (needMore > 0) {
-          const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
-          pick(pool.filter(eligible).filter(belowCap), cnt, needMore, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
-        }
+      if (numRad === 0) {
+        const pool = avail.filter(m => m.role === "radiologist" && !usedIds.has(m.id));
+        pick(pool.filter(eligible).filter(belowCap), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+      }
+      if (numNurse === 0) {
+        const pool = avail.filter(m => m.role === "nurse" && !usedIds.has(m.id));
+        pick(pool.filter(eligible).filter(belowCap), cnt, 1, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
+      }
+      const currentRN = result.filter(id => { const role = getMember(id)?.role; return role === "radiologist" || role === "nurse"; }).length;
+      const needMore = r.weekday_rad_nurse - currentRN;
+      if (needMore > 0) {
+        const pool = avail.filter(m => (m.role === "radiologist" || m.role === "nurse") && !usedIds.has(m.id));
+        pick(pool.filter(eligible).filter(belowCap), cnt, needMore, pool, sel, pairsMap, avoidMap, useRandom, personalCap).forEach(m => { result.push(m.id); usedIds.add(m.id); sel.add(m.id); });
       }
       sched[d] = result;
-      // Don't double-count manually locked day members (already pre-seeded)
+      // Don't double-count manually locked weekday members (already pre-seeded)
       continue;
     }
 
@@ -386,11 +416,10 @@ export function autoGenerate(year, month, members, leave, existingSched, lockedD
         if (!preSeededSet.has(id)) weekCnt[wkKey][id] = (weekCnt[wkKey][id] || 0) + 1;
       });
     } else if (isFriday(dow)) {
-      // Friday uses next weekend's team; only skip increment if that Sat was pre-seeded
-      // (i.e. it's not locked — locked weekends aren't in weekendNonDocTeam pre-seed).
+      // Friday uses next weekend's team; skip increment for members already pre-seeded
+      // (all Saturdays — locked or unlocked — are now in weekendNonDocTeam pre-seed).
       const satDay = d + 1;
-      const nextSatPreseeded = satDay <= days && !(lockedDays && lockedDays.has(satDay));
-      const preSeededFriSet = nextSatPreseeded ? new Set(weekendNonDocTeam[satDay] || []) : new Set();
+      const preSeededFriSet = satDay <= days ? new Set(weekendNonDocTeam[satDay] || []) : new Set();
       result.forEach(id => {
         if (!preSeededFriSet.has(id) && cnt[id] !== undefined) cnt[id]++;
         if (!preSeededFriSet.has(id)) weekCnt[wkKey][id] = (weekCnt[wkKey][id] || 0) + 1;
